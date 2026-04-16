@@ -33,6 +33,10 @@ type PutOptions struct {
 	TTL         time.Duration // 0 = no expiry
 	IfVersion   uint64        // 0 = unconditional, non-zero = CAS check
 	Consistency ConsistencyMode
+	// LogIndex: when non-zero, the replication layer sets this to the Raft log
+	// index so all nodes assign the same version number to the same write.
+	// When zero (standalone tests), the engine uses an internal counter.
+	LogIndex uint64
 }
 
 // This is what a successful write returns to the caller.
