@@ -33,6 +33,8 @@ type MVCCEngine struct {
 	gcHorizon uint64        // GC may only collect versions with Num < gcHorizon
 	stats     EngineStats
 	nodeID    string // reported in GetResult.FromNode
+	gcStats   GCStats
+	gcStatsMu sync.Mutex
 }
 
 // This is the ordered history of all versions for one key. Versions are stored oldest-first (index 0 = oldest)
@@ -280,15 +282,6 @@ func (e *MVCCEngine) Close() error {
 	return nil
 }
 
-// Snapshot and ApplySnapshot are stubs - implemented fully in Phase 3 when we wire up the Raft snapshot mechanism.
-func (e *MVCCEngine) Snapshot() (Snapshot, error) {
-	return nil, fmt.Errorf("snapshot: not yet implemented")
-}
-
-func (e *MVCCEngine) ApplySnapshot(s Snapshot) error {
-	return fmt.Errorf("apply snapshot: not yet implemented")
-}
-
 // When a transaction begins, it pins the current version for each key it reads.
 // This creates a stable read snapshot: subsequent reads in the same transaction always see the same data,
 // even if newer versions are written concurrently.
@@ -349,8 +342,6 @@ func (e *MVCCEngine) gcLoop() {
 		}
 	}
 }
-
-func (e *MVCCEngine) runGC() {}
 
 // --- Internal helpers ---
 
