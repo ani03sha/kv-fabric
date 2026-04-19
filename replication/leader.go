@@ -67,6 +67,11 @@ type RaftNode interface {
 	// Follower progress returns a map of nodeID -> matchIndex for all peers. Only meaningful on the leader;
 	// followers return an empty map.
 	FollowerProgress() map[string]uint64
+
+	// Sends a heartbeat to a quorum of followers and confirms this node is still the leader.
+	// Returns an error if leadership cannot be confirmed, e.g., partitioned or a new leader was elected.
+	// This is the safety check in the ReadIndex protocol.
+	ConfirmLeadership(ctx context.Context) error
 }
 
 // This is a write that has been proposed to Raft but not yet applied. The calling goroutine (HTTP handler)
