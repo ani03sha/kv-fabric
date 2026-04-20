@@ -34,6 +34,17 @@ type Router struct {
 	logger    *zap.Logger
 }
 
+// ErrNotCaughtUp is returned when a node's applied index is behind the version required by the client's session
+// token or monotonic watermark.
+// The HTTP handler converts this to a 503 Service Unavailable with a Retry-After header, signalling the client
+// to retry shortly.
+// It is NOT a permanent failure because the node will catch up through normal replication and the next retry will succeed.
+type ErrNotCaughtUp struct {
+	Mode            string // either "read-your writes" or "monotonic"
+	RequiredVersion uint64 // what the client needs
+	CurrentVersion  uint64 // where this node currently is
+}
+
 func NewRouter(
 	nodeID string,
 	engine store.KVEngine,
@@ -68,6 +79,11 @@ func (r *Router) RegisterRYW(reader Reader) {
 // Plugs in Monotonic reader
 func (r *Router) RegisterMonotonic(reader Reader) {
 	r.monotonic = reader
+}
+
+func (e *ErrNotCaughtUp) Error() string {
+	return fmt.Sprintf("%s: node at applied index %d, requires %d (retry shortly)",
+		e.Mode, e.CurrentVersion, e.RequiredVersion)
 }
 
 // Get routes the read to the correct implementation. Unrecognized modes fall back to Strong which is the safest default.
