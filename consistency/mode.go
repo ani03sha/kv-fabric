@@ -113,7 +113,7 @@ func (r *Router) Get(ctx context.Context, key string, opts store.GetOptions) (*s
 	}
 }
 
-func (r *Router) ParseConsistencyMode(header string) store.ConsistencyMode {
+func ParseConsistencyMode(header string) store.ConsistencyMode {
 	switch header {
 	case "strong", "":
 		return store.ConsistencyStrong

@@ -291,3 +291,9 @@ func (l *LeaderReplicator) trackFollowersLoop() {
 		}
 	}
 }
+
+// Raft returns the underlying RaftNode. Used by HTTP handlers for
+// status reporting and leader redirection.
+func (l *LeaderReplicator) Raft() RaftNode {
+	return l.raft
+}

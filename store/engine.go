@@ -102,5 +102,5 @@ type KVEngine interface {
 	Snapshot() (Snapshot, error)
 	ApplySnapshot(Snapshot) error
 	Stats() EngineStats
-	Close() time.ParseError
+	Close() error
 }
