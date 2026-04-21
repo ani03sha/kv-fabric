@@ -100,6 +100,8 @@ type LeaderReplicator struct {
 
 	stop chan struct{}
 	done chan struct{}
+
+	semiSync *SemiSyncReplicator // nil => async mode, non-nil => semi-sync mode
 }
 
 func NewLeaderReplicator(
@@ -131,6 +133,10 @@ func (l *LeaderReplicator) Start() {
 func (l *LeaderReplicator) Stop() {
 	close(l.stop)
 	<-l.done
+}
+
+func (l *LeaderReplicator) SetSemiSync(ss *SemiSyncReplicator) {
+	l.semiSync = ss
 }
 
 // Propose submits a write to Raft and blocks until it is committed and applied.
@@ -170,6 +176,20 @@ func (l *LeaderReplicator) Propose(ctx context.Context, op KVOperation) (*store.
 
 	select {
 	case res := <-resultCh:
+		// If semi-sync is configured, wait for at least one follower to ACK before returning success
+		// to the client,
+		if res.err == nil && l.semiSync != nil {
+			_, fellback := l.semiSync.WaitForAck(ctx, index)
+			if fellback {
+				l.logger.Warn("semi-sync fallback: write not yet on any follower",
+					zap.Uint64("log_index", index),
+					zap.String("key", ""),
+				)
+				// We still return success — this is the trap.
+				// The write is on the leader's log. It's committed by Raft quorum.
+				// But it's not on any follower yet. If the leader dies now, this write is lost. The client will never know.
+			}
+		}
 		return res.putResult, res.err
 	case <-ctx.Done():
 		// Client gave up. Remove the pending entry so applyLoop doesn't try to signal a goroutine that's
