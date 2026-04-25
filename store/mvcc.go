@@ -136,7 +136,7 @@ func (e *MVCCEngine) Get(key string, opts GetOptions) (*GetResult, error) {
 
 	// Step 2: read from the chain and only chain's read lock is sufficient.
 	chain.mu.RLock()
-	defer chain.mu.Unlock()
+	defer chain.mu.RUnlock()
 
 	var v *Version
 
@@ -179,7 +179,7 @@ func (e *MVCCEngine) GetAtVersion(key string, maxVersion uint64) (*GetResult, er
 	chain.mu.RLock()
 	defer chain.mu.RUnlock()
 
-	v := chain.atOrAfterVersionLocked(maxVersion)
+	v := chain.atOrBeforeVersionLocked(maxVersion)
 	if v == nil || v.Deleted {
 		return &GetResult{FromNode: e.nodeID}, nil
 	}
