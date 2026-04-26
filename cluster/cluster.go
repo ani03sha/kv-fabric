@@ -152,7 +152,6 @@ func Start(logger *zap.Logger) (*Cluster, error) {
 			return nil, fmt.Errorf("start raft node %s: %w", node.ID, err)
 		}
 		node.Leader.Start()
-		node.Follower.Start()
 	}
 
 	// Wait for leader election before returning.
@@ -213,7 +212,6 @@ func (c *Cluster) Stop() {
 
 	for _, node := range c.Nodes {
 		node.Leader.Stop()
-		node.Follower.Stop()
 		node.Raft.Stop()
 		node.Adapter.Close()
 		node.Engine.Close()
@@ -236,7 +234,7 @@ func (c *Cluster) lagLoop() {
 			}
 			for _, node := range c.Nodes {
 				if !node.Adapter.IsLeader() {
-					c.Tracker.UpdateFollower(node.ID, node.Follower.AppliedIndex())
+					c.Tracker.UpdateFollower(node.ID, node.Adapter.AppliedIndex())
 				}
 			}
 		case <-c.stopLag:

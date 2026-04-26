@@ -28,10 +28,11 @@ const (
 // This is what makes the state machine consistent: same inputs, same order. This is what makes the state machine:
 // same order, same state on every node.
 type KVOperation struct {
-	Type  OpType `json:"type"`
-	Key   string `json:"key"`
-	Value []byte `json:"value,omitempty"`
-	TxnID uint64 `json:"txn_id,omitempty"`
+	Type      OpType `json:"type"`
+	Key       string `json:"key"`
+	Value     []byte `json:"value,omitempty"`
+	TxnID     uint64 `json:"txn_id,omitempty"`
+	RequestID string `json:"request_id,omitempty`
 }
 
 // This is the log entry that Raft has committed to the quorum. The index becomes the
@@ -96,7 +97,7 @@ type LeaderReplicator struct {
 	logger  *zap.Logger
 
 	pendingMu sync.Mutex
-	pending   map[uint64]*pendingOp // log index -> blocked client goroutine
+	pending   map[string]*pendingOp // log index -> blocked client goroutine
 
 	stop chan struct{}
 	done chan struct{}
@@ -117,7 +118,7 @@ func NewLeaderReplicator(
 		raft:    raft,
 		tracker: tracker,
 		logger:  logger,
-		pending: make(map[uint64]*pendingOp),
+		pending: make(map[string]*pendingOp),
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
@@ -155,29 +156,35 @@ func (l *LeaderReplicator) Propose(ctx context.Context, op KVOperation) (*store.
 		return nil, fmt.Errorf("not the leader: redirect to %s", l.raft.LeaderID())
 	}
 
+	// Allocate resultCh first so its pointer can serve as a unique request ID.
+	// Pre-register BEFORE calling l.raft.Propose to close the TOCTOU race:
+	// raftly sends the committed entry to commitCh BEFORE calling notifyProposal, so
+	// applyLoop can process the entry (and look for the pending op) before Propose() returns.
+	resultCh := make(chan applyResult, 1)
+	reqID := fmt.Sprintf("%p", resultCh)
+	op.RequestID = reqID
+
 	data, err := json.Marshal(op)
 	if err != nil {
 		return nil, fmt.Errorf("propose: marshal: %w", err)
 	}
 
+	l.pendingMu.Lock()
+	l.pending[reqID] = &pendingOp{result: resultCh}
+	l.pendingMu.Unlock()
+
 	// Submit to Raft. This returns the log index once the leader has accepted the entry locally.
 	// It has not yet been committed to quorum at this point.
 	index, err := l.raft.Propose(ctx, data)
 	if err != nil {
+		l.pendingMu.Lock()
+		delete(l.pending, reqID)
+		l.pendingMu.Unlock()
 		return nil, fmt.Errorf("propose: raft rejected: %w", err)
 	}
 
-	// Register this goroutine as the waiter for log index `index`. When applyLoop commits and
-	// applies this entry, it sends the result here.
-	resultCh := make(chan applyResult, 1) // buffered: applyLoop never blocks on send
-	l.pendingMu.Lock()
-	l.pending[index] = &pendingOp{result: resultCh}
-	l.pendingMu.Unlock()
-
 	select {
 	case res := <-resultCh:
-		// If semi-sync is configured, wait for at least one follower to ACK before returning success
-		// to the client,
 		if res.err == nil && l.semiSync != nil {
 			_, fellback := l.semiSync.WaitForAck(ctx, index)
 			if fellback {
@@ -185,17 +192,12 @@ func (l *LeaderReplicator) Propose(ctx context.Context, op KVOperation) (*store.
 					zap.Uint64("log_index", index),
 					zap.String("key", ""),
 				)
-				// We still return success — this is the trap.
-				// The write is on the leader's log. It's committed by Raft quorum.
-				// But it's not on any follower yet. If the leader dies now, this write is lost. The client will never know.
 			}
 		}
 		return res.putResult, res.err
 	case <-ctx.Done():
-		// Client gave up. Remove the pending entry so applyLoop doesn't try to signal a goroutine that's
-		// no longer listening
 		l.pendingMu.Lock()
-		delete(l.pending, index)
+		delete(l.pending, reqID)
 		l.pendingMu.Unlock()
 		return nil, fmt.Errorf("propose: %w", ctx.Err())
 	}
@@ -263,12 +265,14 @@ func (l *LeaderReplicator) applyEntry(entry CommittedEntry) error {
 		zap.String("key", op.Key))
 
 	// Wake up the client goroutine that's blocked in Propose() for this index.
-	l.pendingMu.Lock()
-	if p, ok := l.pending[entry.Index]; ok {
-		delete(l.pending, entry.Index)
-		p.result <- result // never blocks - channel is buffered
+	if op.RequestID != "" {
+		l.pendingMu.Lock()
+		if p, ok := l.pending[op.RequestID]; ok {
+			delete(l.pending, op.RequestID)
+			p.result <- result // never blocks — channel is buffered
+		}
+		l.pendingMu.Unlock()
 	}
-	l.pendingMu.Unlock()
 
 	return result.err
 }
