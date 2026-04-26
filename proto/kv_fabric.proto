@@ -1,0 +1,119 @@
+syntax = "proto3";
+
+package kvfabric;
+
+option go_package = "github.com/ani03sha/kv-fabric/proto";
+
+// ConsistencyMode maps 1:1 to store.ConsistencyMode.
+// The numeric values are intentional — they match the iota order in engine.go
+// so a cast is safe: store.ConsistencyMode(req.Consistency).
+enum ConsistencyMode {
+  STRONG = 0;
+  EVENTUAL = 1;
+  READ_YOUR_WRITES = 2;
+  MONOTONIC = 3;
+}
+
+service KVFabric {
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Scan(ScanRequest) returns (ScanResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+// Write
+
+message PutRequest {
+    string key = 1;
+    bytes value = 2;
+    // CAS guard: only write if the key's current version == if_version.
+    // 0 = unconditional write. Non-zero = optimistic concurrency control.
+    uint64 if_version = 3;
+}
+
+message PutResponse {
+    // Raft log index assigned to this write.
+    // Use as MinVersion in subsequent monotonic reads, or pass to IssueToken for RYW.
+    uint64 version = 1;
+    // Non-empty when this node is not the leader.
+    // Client should close this connection and dial redirect_to.
+    string redirect_to = 2;
+    // Ready-to-use RYW session token — base64-encoded JSON containing
+    // the leader node ID and this write's version. Pass as session_token
+    // in the next GetRequest to guarantee read-your-writes on any follower.
+    string session_token = 3;
+}
+
+// Read
+
+message GetRequest {
+    string key = 1;
+    ConsistencyMode consistency = 2;
+    // RYW: opaque token from PutResponse.session_token.
+    // The serving follower checks: appliedIndex >= token.WriteVersion.
+    string session_token = 3;
+    // Monotonic: the client's current read watermark.
+    // The serving follower checks: appliedIndex >= min_version.
+    uint64 min_version = 4;
+}
+
+message GetResponse {
+    bytes value = 1; // nil if key does not exist
+    uint64 version = 2; // MVCC version of the returned value
+    bool is_stale = 3; // true when served from a follower that lags the leader
+    int64 lag_ms = 4; // estimated milliseconds behind the leader at read time
+    string from_node = 5; // which cluster node served this read
+    // Non-empty when the follower cannot satisfy the consistency guarantee locally.
+    // Client should retry at redirect_to (RYW / monotonic fallback to leader).
+    string redirect_to = 6;
+}
+
+// Delete
+
+message DeleteRequest {
+    string key = 1;
+    int64 if_version = 2; // 0 = unconditional
+}
+
+message DeleteResponse {
+    string redirect_to = 1;
+}
+
+// Scan
+
+message ScanRequest {
+    string start = 1;
+    string end = 2;
+    int32 limit = 3;
+}
+
+message ScanResponse {
+    repeated KVPair pairs = 1;
+}
+
+message KVPair {
+    string key = 1;
+    bytes value = 2;
+    uint64 version = 3;
+}
+
+// Status
+
+message StatusRequest {}
+
+message StatusResponse {
+    string node_id = 1;
+    bool is_leader = 2;
+    string leader_id = 3;
+    uint64 commit_index = 4;
+    uint64 applied_index = 5;
+    repeated FollowerStatus followers = 6;
+}
+
+message FollowerStatus {
+    string node_id = 1;
+    uint64 match_index = 2;
+    int64 lag_entries = 3;
+    int64 lag_ms = 4;
+}
