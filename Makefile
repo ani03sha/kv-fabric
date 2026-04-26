@@ -72,11 +72,11 @@ docker-build:
 
 # Run all scenarios inside Docker (uses the in-process cluster — no real networking needed).
 docker-scenarios:
-	docker-compose -f docker/docker-compose.yml run --rm runner ./scenarios all
+	docker-compose -f docker/docker-compose.yml run --rm runner
 
 # Run the benchmark inside Docker.
 docker-bench:
-	docker-compose -f docker/docker-compose.yml run --rm runner ./benchmark
+	docker-compose -f docker/docker-compose.yml run --rm --entrypoint ./benchmark runner
 
 docker-down:
 	docker-compose -f docker/docker-compose.yml down -v
