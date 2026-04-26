@@ -1,0 +1,19 @@
+# kv-fabric docker-compose
+#
+# The in-process cluster (InMemTransport) runs all three Raft nodes inside one OS process.
+# Docker containers add process isolation and reproducible builds — not real network topology.
+# For a real multi-node networked deployment you would need cmd/server/main.go with gRPC transport.
+#
+# Usage:
+#   make docker-build          # build image
+#   make docker-scenarios      # run all failure scenarios
+#   make docker-bench          # run 80-run benchmark (~4 minutes)
+
+services:
+    runner:
+        image: kv-fabric:latest
+        build:
+            context: ..
+            dockerfile: docker/Dockerfile
+        # Default: ./scenarios all
+        # Override: docker compose run runner ./benchmark
