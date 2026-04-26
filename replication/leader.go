@@ -151,7 +151,7 @@ func (l *LeaderReplicator) SetSemiSync(ss *SemiSyncReplicator) {
 // ctx.Done() is closed and Propose returns an error immediately. The pending op
 // is cleaned up so it doesn't leak.
 func (l *LeaderReplicator) Propose(ctx context.Context, op KVOperation) (*store.PutResult, error) {
-	if l.raft.IsLeader() {
+	if !l.raft.IsLeader() {
 		return nil, fmt.Errorf("not the leader: redirect to %s", l.raft.LeaderID())
 	}
 
