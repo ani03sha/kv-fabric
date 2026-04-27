@@ -61,8 +61,8 @@ func init() {
 	// Persistent flags are inherited by all subcommands.
 	rootCmd.PersistentFlags().StringVar(&flagNodes,
 		"nodes",
-		"http://localhost:8001,http://localhost:8002,http://localhost:8003",
-		"Comma-separated list of node addresses",
+		"localhost:9001,localhost:9002,localhost:9003",
+		"Comma-separated list of node gRPC addresses",
 	)
 	rootCmd.PersistentFlags().StringVar(&flagConsistency,
 		"consistency", "strong",
@@ -251,8 +251,6 @@ var statusCmd = &cobra.Command{
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		// If --node specified, query only that node.
-		// Otherwise query all nodes.
 		addrs := strings.Split(flagNodes, ",")
 		if statusNode != "" {
 			addrs = []string{strings.TrimSpace(statusNode)}
@@ -265,13 +263,19 @@ var statusCmd = &cobra.Command{
 				fmt.Printf("%-30s  error: %v\n", addr, err)
 				continue
 			}
-			fmt.Printf("node:          %s (%s)\n", s.NodeID, s.State)
+			role := "follower"
+			if s.IsLeader {
+				role = "leader"
+			}
+			fmt.Printf("node:          %s (%s)\n", s.NodeID, role)
+			fmt.Printf("leader:        %s\n", s.LeaderID)
 			fmt.Printf("commit_index:  %d\n", s.CommitIndex)
 			fmt.Printf("applied_index: %d\n", s.AppliedIndex)
-			if len(s.ReplicationLag) > 0 {
-				fmt.Println("replication_lag:")
-				for nodeID, lagMs := range s.ReplicationLag {
-					fmt.Printf("  %s: %dms\n", nodeID, lagMs)
+			if len(s.Followers) > 0 {
+				fmt.Println("followers:")
+				for _, f := range s.Followers {
+					fmt.Printf("  %-10s  match=%-6d  lag=%dms\n",
+						f.NodeID, f.MatchIndex, f.LagMs)
 				}
 			}
 			fmt.Println()

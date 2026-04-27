@@ -1,52 +1,46 @@
 package client
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"sync"
 	"time"
 
+	pb "github.com/ani03sha/kv-fabric/proto"
 	"github.com/ani03sha/kv-fabric/store"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type Config struct {
-	// Base HTTP URLs of all cluster nodes.  e.g. ["http://localhost:8001", "http://localhost:8002", "http://localhost:8003"]
-	// Reads are distributed across all nodes (round-robin). Writes are retried until the leader accepts.
+	// gRPC addresses of all cluster nodes, e.g. ["localhost:9001", "localhost:9002", "localhost:9003"].
+	// Reads are distributed round-robin. Writes iterate until the leader accepts.
 	Addrs []string
 
-	// This is used when PutOptions/GetOptions don't specify a mode.
+	// Default consistency mode when PutOptions/GetOptions specify none.
 	DefaultConsistency store.ConsistencyMode
 
 	// Per-request deadline. Default: 30s.
 	Timeout time.Duration
 }
 
-// Controls the behaviour of the Put call
 type PutOptions struct {
-	Consistency store.ConsistencyMode // 0 = use client default
-	IfVersion   uint64                // 0 = unconditional write
+	Consistency store.ConsistencyMode
+	IfVersion   uint64
 }
 
-// Controls the behavior of a Get call.
 type GetOptions struct {
 	Consistency  store.ConsistencyMode
-	SessionToken string // for ReadYourWrites: token from last Put
-	MinVersion   uint64 // for Monotonic: minimum version watermark
-	MaxRetries   int    // max retries on 503 (default 3)
+	SessionToken string // RYW: token from PutResult.SessionToken
+	MinVersion   uint64 // Monotonic: client watermark
+	MaxRetries   int    // redirect retries (default 3)
 }
 
-// This is the parsed response from a successful Put.
 type PutResult struct {
 	Version      uint64
-	SessionToken string // use this for subsequent ReadYourWrites Gets
+	SessionToken string
 }
 
-// This is the parsed response from a successful Get.
 type GetResult struct {
 	Value    []byte
 	Version  uint64
@@ -55,342 +49,329 @@ type GetResult struct {
 	LagMs    int64
 }
 
-// This is one entry from a Scan result.
 type KVPair struct {
 	Key     string
 	Value   []byte
 	Version uint64
 }
 
-// This is the parsed response from a Status call.
+type FollowerStatus struct {
+	NodeID     string
+	MatchIndex uint64
+	LagEntries int64
+	LagMs      int64
+}
+
 type StatusResult struct {
-	NodeID         string
-	State          string
-	CommitIndex    uint64
-	AppliedIndex   uint64
-	ReplicationLag map[string]int64
+	NodeID       string
+	IsLeader     bool
+	LeaderID     string
+	CommitIndex  uint64
+	AppliedIndex uint64
+	Followers    []FollowerStatus
 }
 
-// This is returned when the server responds 503 with Retry-After.
-// The client retries automatically up to MaxRetries: this error only surfaces when all retries are exhausted.
-type RetryableError struct {
-	StatusCode int
-	Message    string
-	RetryAfter time.Duration
-}
-
-func (e *RetryableError) Error() string {
-	return fmt.Sprintf("server not ready (HTTP %d): %s", e.StatusCode, e.Message)
-}
-
-// This is a thread-safe kv-fabric client. Create one instance and share it across goroutines.
+// Client is a thread-safe gRPC client for kv-fabric.
+// Share a single instance across goroutines — gRPC multiplexes RPCs internally.
 type Client struct {
-	cfg     Config
-	http    *http.Client
-	mu      sync.Mutex
-	nodeIdx int // round-robin cursor for reads
+	cfg   Config
+	addrs []string // ordered list from Config.Addrs
+
+	mu      sync.RWMutex
+	conns   map[string]*grpc.ClientConn  // address → connection (lazy)
+	stubs   map[string]pb.KVFabricClient // address → stub (lazy)
+	readIdx int                          // round-robin cursor for reads
 }
 
-// This creates a new Client. The underlying http.Client is shared across all calls:
-// its connection pool is what makes high-throughput benchmarks work.
 func NewClient(cfg Config) *Client {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 30 * time.Second
 	}
-	return &Client{
-		cfg: cfg,
-		http: &http.Client{
-			Timeout: cfg.Timeout,
-			Transport: &http.Transport{
-				MaxIdleConnsPerHost: 32,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		},
+	c := &Client{
+		cfg:   cfg,
+		addrs: cfg.Addrs,
+		conns: make(map[string]*grpc.ClientConn),
+		stubs: make(map[string]pb.KVFabricClient),
 	}
+	// Pre-create stubs so the first RPC is not slower than subsequent ones.
+	// grpc.NewClient is non-blocking: the connection is established on the
+	// first actual RPC, not here.
+	for _, addr := range cfg.Addrs {
+		_, _ = c.getOrCreateStub(addr)
+	}
+	return c
 }
 
-// This function writes a key-value pair to the cluster. Automatically retries against other nodes if
-// it hits a non-leader.
-func (c *Client) Put(ctx context.Context, key string, value []byte, opts PutOptions) (*PutResult, error) {
-	consistency := opts.Consistency
-	if consistency == 0 {
-		consistency = c.cfg.DefaultConsistency
-	}
-
-	body, err := json.Marshal(map[string]any{
-		"value":      value,
-		"if_version": opts.IfVersion,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("put: marshal: %w", err)
-	}
-
-	// Writes must go to the leader. Try each node in turn until one accepts.
+// Close releases all gRPC connections.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	var lastErr error
-	for i := 0; i < len(c.cfg.Addrs); i++ {
-		addr := c.cfg.Addrs[i%len(c.cfg.Addrs)]
-		url := fmt.Sprintf("%s/v1/keys/%s", addr, key)
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
-		if err != nil {
-			return nil, fmt.Errorf("put: build request: %w", err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Consistency", consistency.String())
-
-		resp, err := c.http.Do(req)
-		if err != nil {
+	for _, conn := range c.conns {
+		if err := conn.Close(); err != nil {
 			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+// ── Writes ────────────────────────────────────────────────────────────────────
+
+// Put writes key=value to the cluster. Iterates through addresses, following
+// redirect_to hints, until the leader accepts the write.
+//
+// In a stable 3-node cluster this is 1-2 hops: hit any follower → redirect
+// to leader → success. The tried map prevents redirect loops.
+func (c *Client) Put(ctx context.Context, key string, value []byte, opts PutOptions) (*PutResult, error) {
+	req := &pb.PutRequest{
+		Key:       key,
+		Value:     value,
+		IfVersion: opts.IfVersion,
+	}
+
+	tried := make(map[string]bool)
+	queue := make([]string, len(c.addrs))
+	copy(queue, c.addrs)
+
+	for len(queue) > 0 {
+		addr := queue[0]
+		queue = queue[1:]
+
+		if tried[addr] {
 			continue
 		}
-		defer resp.Body.Close()
+		tried[addr] = true
 
-		if resp.StatusCode == http.StatusServiceUnavailable {
-			// Not the leader: the response includes X-Leader-ID.
-			// We don't have an ID→address map here, so just try the next node.
-			lastErr = fmt.Errorf("node %s is not leader", addr)
+		stub, err := c.getOrCreateStub(addr)
+		if err != nil {
+			continue // node unreachable; try next
+		}
+
+		ctx2, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
+		resp, err := stub.Put(ctx2, req)
+		cancel()
+		if err != nil {
 			continue
 		}
 
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("put: HTTP %d from %s", resp.StatusCode, addr)
-		}
-
-		var result struct {
-			Version      uint64 `json:"version"`
-			SessionToken string `json:"session_token"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return nil, fmt.Errorf("put: decode response: %w", err)
+		if resp.RedirectTo != "" {
+			// Prepend so the redirect is tried before any remaining fallbacks.
+			queue = append([]string{resp.RedirectTo}, queue...)
+			continue
 		}
 
 		return &PutResult{
-			Version:      result.Version,
-			SessionToken: result.SessionToken,
+			Version:      resp.Version,
+			SessionToken: resp.SessionToken,
 		}, nil
 	}
 
-	return nil, fmt.Errorf("put %q: all nodes rejected: %w", key, lastErr)
+	return nil, fmt.Errorf("put %q: no leader found in cluster", key)
 }
 
-// Get reads a value from the cluster. For ReadYourWrites and Monotonic modes, it retries on 503 with exponential
-// backoff: the caller does not need to handle temporary version mismatches.
+// Delete removes a key from the cluster. Same redirect-following logic as Put.
+func (c *Client) Delete(ctx context.Context, key string) error {
+	req := &pb.DeleteRequest{Key: key}
+
+	tried := make(map[string]bool)
+	queue := make([]string, len(c.addrs))
+	copy(queue, c.addrs)
+
+	for len(queue) > 0 {
+		addr := queue[0]
+		queue = queue[1:]
+
+		if tried[addr] {
+			continue
+		}
+		tried[addr] = true
+
+		stub, err := c.getOrCreateStub(addr)
+		if err != nil {
+			continue
+		}
+
+		ctx2, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
+		resp, err := stub.Delete(ctx2, req)
+		cancel()
+		if err != nil {
+			continue
+		}
+
+		if resp.RedirectTo != "" {
+			queue = append([]string{resp.RedirectTo}, queue...)
+			continue
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("delete %q: no leader found in cluster", key)
+}
+
+// ── Reads ─────────────────────────────────────────────────────────────────────
+
+// Get reads a value using the specified consistency mode. For strong reads and
+// RYW/monotonic fallbacks, the server returns redirect_to pointing at the node
+// that can satisfy the guarantee. The client follows it transparently.
 func (c *Client) Get(ctx context.Context, key string, opts GetOptions) (*GetResult, error) {
 	maxRetries := opts.MaxRetries
 	if maxRetries == 0 {
 		maxRetries = 3
 	}
 
-	consistency := opts.Consistency
-	if consistency == 0 {
-		consistency = c.cfg.DefaultConsistency
+	req := &pb.GetRequest{
+		Key:          key,
+		Consistency:  pb.ConsistencyMode(c.resolveConsistency(opts.Consistency)),
+		SessionToken: opts.SessionToken,
+		MinVersion:   opts.MinVersion,
 	}
 
-	backoff := 100 * time.Millisecond
+	tried := make(map[string]bool)
+	addr := c.nextReadAddr()
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		result, err := c.doGet(ctx, key, consistency, opts.SessionToken, opts.MinVersion)
-		if err == nil {
-			return result, nil
+		if tried[addr] {
+			break
+		}
+		tried[addr] = true
+
+		stub, err := c.getOrCreateStub(addr)
+		if err != nil {
+			addr = c.nextReadAddr()
+			continue
 		}
 
-		var retryable *RetryableError
-		if errors.As(err, &retryable) && attempt < maxRetries {
-			// 503: node not yet caught up. Wait and retry.
-			// Use the larger of our backoff and the server's Retry-After hint.
-			wait := backoff
-			if retryable.RetryAfter > wait {
-				wait = retryable.RetryAfter
-			}
-			select {
-			case <-time.After(wait):
-				backoff *= 2 // exponential backoff
-				continue
-			case <-ctx.Done():
-				return nil, fmt.Errorf("get %q: %w", key, ctx.Err())
-			}
+		ctx2, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
+		resp, err := stub.Get(ctx2, req)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("get %q: %w", key, err)
 		}
 
-		return nil, fmt.Errorf("get %q: %w", key, err)
+		if resp.RedirectTo != "" {
+			addr = resp.RedirectTo
+			continue
+		}
+
+		return &GetResult{
+			Value:    resp.Value,
+			Version:  resp.Version,
+			FromNode: resp.FromNode,
+			IsStale:  resp.IsStale,
+			LagMs:    resp.LagMs,
+		}, nil
 	}
 
 	return nil, fmt.Errorf("get %q: exhausted %d retries", key, maxRetries)
 }
 
-// Performs a single GET attempt against the next node in round-robin order.
-func (c *Client) doGet(
-	ctx context.Context,
-	key string,
-	consistency store.ConsistencyMode,
-	sessionToken string,
-	minVersion uint64,
-) (*GetResult, error) {
-	addr := c.nextNode()
-	url := fmt.Sprintf("%s/v1/keys/%s", addr, key)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("X-Consistency", consistency.String())
-	if sessionToken != "" {
-		req.Header.Set("X-Session-Token", sessionToken)
-	}
-	if minVersion > 0 {
-		req.Header.Set("X-Min-Version", fmt.Sprintf("%d", minVersion))
-	}
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusServiceUnavailable {
-		rawBody, _ := io.ReadAll(resp.Body)
-		retryAfter := 100 * time.Millisecond
-		if s := resp.Header.Get("Retry-After"); s != "" {
-			if secs, err := parseRetryAfter(s); err == nil {
-				retryAfter = time.Duration(secs) * time.Second
-			}
-		}
-		return nil, &RetryableError{
-			StatusCode: resp.StatusCode,
-			Message:    string(rawBody),
-			RetryAfter: retryAfter,
-		}
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		rawBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, rawBody)
-	}
-
-	var result struct {
-		Value    []byte `json:"value"`
-		Version  uint64 `json:"version"`
-		FromNode string `json:"from_node"`
-		IsStale  bool   `json:"is_stale"`
-		LagMs    int64  `json:"lag_ms"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-
-	return &GetResult{
-		Value:    result.Value,
-		Version:  result.Version,
-		FromNode: result.FromNode,
-		IsStale:  result.IsStale,
-		LagMs:    result.LagMs,
-	}, nil
-}
-
-func (c *Client) Delete(ctx context.Context, key string) error {
-	for i := 0; i < len(c.cfg.Addrs); i++ {
-		addr := c.cfg.Addrs[i%len(c.cfg.Addrs)]
-		url := fmt.Sprintf("%s/v1/keys/%s", addr, key)
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
-		if err != nil {
-			return fmt.Errorf("delete: %w", err)
-		}
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			continue
-		}
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusNoContent {
-			return nil
-		}
-		if resp.StatusCode == http.StatusServiceUnavailable {
-			continue // try next node
-		}
-		return fmt.Errorf("delete: HTTP %d", resp.StatusCode)
-	}
-	return fmt.Errorf("delete %q: all nodes rejected", key)
-}
-
-// Returns all keys in [start, end) up to limit entries.
+// Scan returns all key-value pairs in [start, end) up to limit entries.
+// Scans always read from a single node with eventual semantics.
 func (c *Client) Scan(ctx context.Context, start, end string, limit int) ([]KVPair, error) {
-	addr := c.nextNode()
-	url := fmt.Sprintf("%s/v1/keys?start=%s&end=%s&limit=%d", addr, start, end, limit)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	stub, err := c.getOrCreateStub(c.nextReadAddr())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("scan: %w", err)
 	}
 
-	resp, err := c.http.Do(req)
+	ctx2, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
+	defer cancel()
+
+	resp, err := stub.Scan(ctx2, &pb.ScanRequest{
+		Start: start,
+		End:   end,
+		Limit: int32(limit),
+	})
 	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Keys []struct {
-			Key     string `json:"key"`
-			Value   []byte `json:"value"`
-			Version uint64 `json:"version"`
-		} `json:"keys"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("scan [%q, %q): %w", start, end, err)
 	}
 
-	pairs := make([]KVPair, len(result.Keys))
-	for i, k := range result.Keys {
-		pairs[i] = KVPair{Key: k.Key, Value: k.Value, Version: k.Version}
+	pairs := make([]KVPair, len(resp.Pairs))
+	for i, p := range resp.Pairs {
+		pairs[i] = KVPair{Key: p.Key, Value: p.Value, Version: p.Version}
 	}
 	return pairs, nil
 }
 
-// Fetches the status from a specific node address.
+// Status fetches cluster status from a specific node address.
 func (c *Client) Status(ctx context.Context, addr string) (*StatusResult, error) {
-	url := fmt.Sprintf("%s/v1/status", addr)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	stub, err := c.getOrCreateStub(addr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("status: connect to %s: %w", addr, err)
 	}
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	ctx2, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
+	defer cancel()
 
-	var result struct {
-		NodeID         string           `json:"node_id"`
-		State          string           `json:"state"`
-		CommitIndex    uint64           `json:"commit_index"`
-		AppliedIndex   uint64           `json:"applied_index"`
-		ReplicationLag map[string]int64 `json:"replication_lag"`
+	resp, err := stub.Status(ctx2, &pb.StatusRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("status from %s: %w", addr, err)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+
+	followers := make([]FollowerStatus, len(resp.Followers))
+	for i, f := range resp.Followers {
+		followers[i] = FollowerStatus{
+			NodeID:     f.NodeId,
+			MatchIndex: f.MatchIndex,
+			LagEntries: f.LagEntries,
+			LagMs:      f.LagMs,
+		}
 	}
 
 	return &StatusResult{
-		NodeID:         result.NodeID,
-		State:          result.State,
-		CommitIndex:    result.CommitIndex,
-		AppliedIndex:   result.AppliedIndex,
-		ReplicationLag: result.ReplicationLag,
+		NodeID:       resp.NodeId,
+		IsLeader:     resp.IsLeader,
+		LeaderID:     resp.LeaderId,
+		CommitIndex:  resp.CommitIndex,
+		AppliedIndex: resp.AppliedIndex,
+		Followers:    followers,
 	}, nil
 }
 
-func (c *Client) nextNode() string {
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+// getOrCreateStub returns the gRPC stub for addr, creating a connection if needed.
+// Double-checked locking: fast RLock on the common path (stub exists),
+// write Lock only when a new connection must be created.
+func (c *Client) getOrCreateStub(addr string) (pb.KVFabricClient, error) {
+	c.mu.RLock()
+	stub, ok := c.stubs[addr]
+	c.mu.RUnlock()
+	if ok {
+		return stub, nil
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	addr := c.cfg.Addrs[c.nodeIdx%len(c.cfg.Addrs)]
-	c.nodeIdx++
+	if stub, ok := c.stubs[addr]; ok { // re-check after acquiring write lock
+		return stub, nil
+	}
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("connect to %s: %w", addr, err)
+	}
+
+	stub = pb.NewKVFabricClient(conn)
+	c.conns[addr] = conn
+	c.stubs[addr] = stub
+	return stub, nil
+}
+
+func (c *Client) nextReadAddr() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	addr := c.addrs[c.readIdx%len(c.addrs)]
+	c.readIdx++
 	return addr
 }
 
-func parseRetryAfter(s string) (int, error) {
-	var n int
-	_, err := fmt.Sscanf(s, "%d", &n)
-	return n, err
+// resolveConsistency returns the effective mode for a request.
+// Zero (Strong) is indistinguishable from "not set" — if the default is also
+// Strong this is a no-op, which is the common case.
+func (c *Client) resolveConsistency(mode store.ConsistencyMode) store.ConsistencyMode {
+	if mode == store.ConsistencyStrong {
+		return c.cfg.DefaultConsistency
+	}
+	return mode
 }

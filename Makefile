@@ -1,4 +1,3 @@
-SERVER_BIN := $(BIN_DIR)/server
 MODULE  := github.com/ani03sha/kv-fabric
 BIN_DIR := bin
 
@@ -9,6 +8,7 @@ LDFLAGS := -ldflags="-s -w"
 SCENARIOS_BIN := $(BIN_DIR)/scenarios
 BENCH_BIN     := $(BIN_DIR)/benchmark
 KVCTL_BIN     := $(BIN_DIR)/kvctl
+SERVER_BIN    := $(BIN_DIR)/server
 
 .PHONY: all build scenarios bench test test-unit vet clean \
         cluster-start cluster-stop cluster-clean \
@@ -82,8 +82,6 @@ cluster-stop:
 # cluster-clean stops the cluster and removes the WAL data directories.
 cluster-clean: cluster-stop
 	rm -rf data/
-
-And add Docker cluster targets after the existing docker-down target:
 
 # Bring up the 3-node containerised cluster.
 docker-cluster-start:

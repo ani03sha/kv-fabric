@@ -34,3 +34,4 @@ go.work.sum
 PROJECT_OVERVIEW.md
 
 bin/
+data/
