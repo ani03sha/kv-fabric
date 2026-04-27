@@ -96,7 +96,8 @@ func (f *FollowerApplier) applyEntry(entry CommittedEntry) error {
 	switch op.Type {
 	case OpPut:
 		if _, err := f.engine.Put(op.Key, op.Value, store.PutOptions{
-			LogIndex: entry.Index,
+			LogIndex:  entry.Index,
+			IfVersion: op.IfVersion,
 		}); err != nil {
 			return fmt.Errorf("follower %s: apply entry %d: put %q: %w", f.nodeID, entry.Index, op.Key, err)
 		}

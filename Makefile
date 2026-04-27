@@ -1,3 +1,4 @@
+SERVER_BIN := $(BIN_DIR)/server
 MODULE  := github.com/ani03sha/kv-fabric
 BIN_DIR := bin
 
@@ -10,21 +11,24 @@ BENCH_BIN     := $(BIN_DIR)/benchmark
 KVCTL_BIN     := $(BIN_DIR)/kvctl
 
 .PHONY: all build scenarios bench test test-unit vet clean \
-		docker-build docker-up docker-down \
-		scenario-phantom scenario-booking scenario-mvcc-bloat scenario-dirty-read
+        cluster-start cluster-stop cluster-clean \
+        docker-build docker-scenarios docker-bench \
+        docker-cluster-start docker-cluster-stop docker-cluster-clean \
+        scenario-phantom scenario-booking scenario-mvcc-bloat scenario-dirty-read
 
 all: build
 
-## ── Build ────────────────────────────────────────────────────────────────────
+## --- Build ---
 
 build:
 	@mkdir -p $(BIN_DIR)
 	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(SCENARIOS_BIN) ./cmd/scenarios
 	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BENCH_BIN)     ./cmd/benchmark
 	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(KVCTL_BIN)     ./cmd/kvctl
-	@echo "built: $(SCENARIOS_BIN)  $(BENCH_BIN)  $(KVCTL_BIN)"
+	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(SERVER_BIN)    ./cmd/server
+	@echo "built: $(SCENARIOS_BIN)  $(BENCH_BIN)  $(KVCTL_BIN)  $(SERVER_BIN)"
 
-## ── Scenarios ────────────────────────────────────────────────────────────────
+## --- Scenarios ---
 
 # Run all 4 failure scenarios in sequence.
 scenarios: build
@@ -41,6 +45,57 @@ scenario-mvcc-bloat: build
 
 scenario-dirty-read: build
 	./$(SCENARIOS_BIN) dirty-read
+
+## ── Local cluster ────────────────────────────────────────────────────────────
+
+# Start a 3-node cluster on localhost in the background.
+# Each node writes its PID to /tmp and logs to /tmp/kv-fabric-node-N.log.
+# KV ports: 9001 (node-1), 9002 (node-2), 9003 (node-3).
+cluster-start: build
+	@mkdir -p data/node-1 data/node-2 data/node-3
+	@$(SERVER_BIN) \
+		--id node-1 --raft-addr :7001 --kv-addr :9001 \
+		--raft-peers "node-2=:7002,node-3=:7003" \
+		--kv-peers   "node-2=:9002,node-3=:9003" \
+		--data-dir data/node-1 \
+		>> /tmp/kv-fabric-node-1.log 2>&1 & echo $$! > /tmp/kv-fabric-node-1.pid
+	@$(SERVER_BIN) \
+		--id node-2 --raft-addr :7002 --kv-addr :9002 \
+		--raft-peers "node-1=:7001,node-3=:7003" \
+		--kv-peers   "node-1=:9001,node-3=:9003" \
+		--data-dir data/node-2 \
+		>> /tmp/kv-fabric-node-2.log 2>&1 & echo $$! > /tmp/kv-fabric-node-2.pid
+	@$(SERVER_BIN) \
+		--id node-3 --raft-addr :7003 --kv-addr :9003 \
+		--raft-peers "node-1=:7001,node-2=:7002" \
+		--kv-peers   "node-1=:9001,node-2=:9002" \
+		--data-dir data/node-3 \
+		>> /tmp/kv-fabric-node-3.log 2>&1 & echo $$! > /tmp/kv-fabric-node-3.pid
+	@echo "cluster started — logs: /tmp/kv-fabric-node-{1,2,3}.log"
+
+cluster-stop:
+	@for f in /tmp/kv-fabric-node-1.pid /tmp/kv-fabric-node-2.pid /tmp/kv-fabric-node-3.pid; do \
+		[ -f $$f ] && kill $$(cat $$f) 2>/dev/null && rm -f $$f || true; \
+	done
+	@echo "cluster stopped"
+
+# cluster-clean stops the cluster and removes the WAL data directories.
+cluster-clean: cluster-stop
+	rm -rf data/
+
+And add Docker cluster targets after the existing docker-down target:
+
+# Bring up the 3-node containerised cluster.
+docker-cluster-start:
+	docker compose -f docker/docker-compose-cluster.yml up -d
+
+# Stop the cluster, keep volumes.
+docker-cluster-stop:
+	docker compose -f docker/docker-compose-cluster.yml down
+
+# Stop the cluster and delete all WAL volumes.
+docker-cluster-clean:
+	docker compose -f docker/docker-compose-cluster.yml down -v
 
 ## ── Benchmark ────────────────────────────────────────────────────────────────
 

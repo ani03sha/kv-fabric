@@ -20,6 +20,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
         -o bin/kvctl ./cmd/kvctl
 
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
+        -o bin/server ./cmd/server
+
 # Stage 2 — Runtime
 # Alpine gives us a shell for debugging. Scratch would be even smaller but loses
 # the ability to exec into the container.
@@ -30,6 +33,7 @@ WORKDIR /app
 COPY --from=builder /app/bin/scenarios  ./scenarios
 COPY --from=builder /app/bin/benchmark  ./benchmark
 COPY --from=builder /app/bin/kvctl      ./kvctl
+COPY --from=builder /app/bin/server ./server
 
 # Default: run all scenarios.
 # Override with: docker run kv-fabric:latest ./benchmark

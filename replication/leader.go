@@ -32,7 +32,8 @@ type KVOperation struct {
 	Key       string `json:"key"`
 	Value     []byte `json:"value,omitempty"`
 	TxnID     uint64 `json:"txn_id,omitempty"`
-	RequestID string `json:"request_id,omitempty`
+	IfVersion uint64 `json:"if_version,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
 }
 
 // This is the log entry that Raft has committed to the quorum. The index becomes the
@@ -244,7 +245,8 @@ func (l *LeaderReplicator) applyEntry(entry CommittedEntry) error {
 			// LogIndex makes the Raft log index the version number.
 			// Every node applies this same entry with this same index,
 			// so every node's engine assigns version = entry.Index to this write.
-			LogIndex: entry.Index,
+			LogIndex:  entry.Index,
+			IfVersion: op.IfVersion,
 		})
 		result = applyResult{putResult: r, err: err}
 	case OpDelete:

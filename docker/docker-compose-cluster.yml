@@ -1,0 +1,59 @@
+# kv-fabric: 3-node cluster, one container per node.
+#
+# Each node gets:
+#   - Its own named volume for WAL durability across container restarts
+#   - A dedicated Raft port (7001-7003) for inter-node Raft gRPC
+#   - A dedicated KV port  (9001-9003) for client-facing gRPC, exposed to the host
+#
+# Within Docker's bridge network, services reach each other by service name.
+# "node-2=node-2:7002" means: peer ID "node-2" is reachable at host "node-2", port 7002.
+# This is different from the local cluster (make cluster-start) where all
+# nodes are on 127.0.0.1 and ":7002" suffices.
+#
+# Usage:
+#   make docker-build           # build the image once
+#   make docker-cluster-start   # bring up 3 nodes
+#   make docker-cluster-stop    # tear down (volumes preserved)
+#   make docker-cluster-clean   # tear down + delete volumes
+
+services:
+    node-1:
+        image: kv-fabric:latest
+        entrypoint: ./server
+        command: >
+            --id node-1 --raft-addr :7001 --kv-addr :9001 --raft-peers
+            node-2=node-2:7002,node-3=node-3:7003
+            --kv-peers   node-2=node-2:9002,node-3=node-3:9003
+        ports:
+            - "9001:9001"
+        volumes:
+            - node1-data:/app/data/node-1
+
+    node-2:
+        image: kv-fabric:latest
+        entrypoint: ./server
+        command: >
+            --id node-2 --raft-addr :7002 --kv-addr :9002 --raft-peers
+            node-1=node-1:7001,node-3=node-3:7003
+            --kv-peers   node-1=node-1:9001,node-3=node-3:9003
+        ports:
+            - "9002:9002"
+        volumes:
+            - node2-data:/app/data/node-2
+
+    node-3:
+        image: kv-fabric:latest
+        entrypoint: ./server
+        command: >
+            --id node-3 --raft-addr :7003 --kv-addr :9003 --raft-peers
+            node-1=node-1:7001,node-2=node-2:7002
+            --kv-peers   node-1=node-1:9001,node-2=node-2:9002
+        ports:
+            - "9003:9003"
+        volumes:
+            - node3-data:/app/data/node-3
+
+volumes:
+    node1-data:
+    node2-data:
+    node3-data:
