@@ -46,6 +46,7 @@ LeaderReplicator.applyLoop()          ← replication/leader.go
   │  applyEntry(CommittedEntry)
   │  → engine.Put(key, value, PutOptions{LogIndex: entry.Index})
   │  → tracker.UpdateLeaderCommitIndex(entry.Index)
+  │  → SnapshotManager.MaybeTakeSnapshot(entry.Index)  ← log compaction trigger
   │  → pending[op.RequestID].result <- applyResult{putResult, nil}
   │
   ▼
@@ -85,7 +86,9 @@ Client
        (watermark lives in the client; server is stateless)
 ```
 
-### Cluster topology (in-process)
+### Cluster topology
+
+**In-process (scenarios and benchmarks)**
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -97,7 +100,7 @@ Client
 │  │              │   │              │   │              │               │
 │  │ MVCCEngine   │   │ MVCCEngine   │   │ MVCCEngine   │               │
 │  │ LeaderRepl   │   │ LeaderRepl   │   │ LeaderRepl   │               │
-│  │ FollowerAppl │   │ FollowerAppl │   │ FollowerAppl │               │
+│  │ SnapManager  │   │ SnapManager  │   │ SnapManager  │               │
 │  │ RaftlyAdapter│   │ RaftlyAdapter│   │ RaftlyAdapter│               │
 │  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘               │
 │         │                  │                  │                        │
@@ -107,6 +110,30 @@ Client
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
+**Networked (`make cluster-start` / `make docker-cluster-start`)**
+
+```
+  kvctl (gRPC client)
+     │  :9001 / :9002 / :9003
+     │
+     ▼
+┌──────────────┐   Raft gRPC   ┌──────────────┐   Raft gRPC   ┌──────────────┐
+│   node-1     │◄─────────────►│   node-2     │◄─────────────►│   node-3     │
+│  :7001 raft  │               │  :7002 raft  │               │  :7003 raft  │
+│  :9001 kv    │               │  :9002 kv    │               │  :9003 kv    │
+│              │               │              │               │              │
+│ GRPCTransport│               │ GRPCTransport│               │ GRPCTransport│
+│ MVCCEngine   │               │ MVCCEngine   │               │ MVCCEngine   │
+│ LeaderRepl   │               │ LeaderRepl   │               │ LeaderRepl   │
+│ SnapManager  │               │ SnapManager  │               │ SnapManager  │
+│ KVServer     │               │ KVServer     │               │ KVServer     │
+└──────────────┘               └──────────────┘               └──────────────┘
+   data/node-1/                  data/node-2/                  data/node-3/
+   (WAL + snapshots)             (WAL + snapshots)             (WAL + snapshots)
+```
+
+Non-leader nodes return a `redirect_to` address in the gRPC response. `kvctl` follows the redirect and retries against the leader — no internal server-to-server forwarding, which keeps traces unambiguous.
+
 InMemTransport carries real Raft consensus — elections, log replication, commit quorum — with zero network overhead. ChaosInjector injects the same failure modes (crash, partition, lag) that happen on real hardware by intercepting messages at the NetworkProxy layer.
 
 ---
@@ -114,27 +141,23 @@ InMemTransport carries real Raft consensus — elections, log replication, commi
 ## Package dependency graph
 
 ```
-cmd/scenarios   cmd/benchmark   cmd/kvctl
-      │               │              │
-      └───────┬────────┘              │
-              ▼                       │
-          scenarios               (kvctl talks
-          benchmark                directly to
-              │                    cluster API)
-              ▼
-           cluster ──────────────────────────┐
-              │                              │
-              ▼                              ▼
-        replication ◄────────────────── consistency
-              │                              │
-              ▼                              │
-            store ◄───────────────────────────┘
+cmd/scenarios  cmd/benchmark  cmd/kvctl  cmd/server
+      │               │            │          │
+      └───────┬────────┘            │          │
+              ▼                     ▼          ▼
+           cluster              client      server ──── proto/
+              │                                │
+              ▼                                │
+        replication ◄──────────────── consistency
+              │                                │
+              ▼                                │
+            store ◄─────────────────────────────┘
               │
               ▼
          raftly (external: github.com/ani03sha/raftly)
 ```
 
-**Rule**: lower packages never import upper ones. `store` knows nothing about Raft. `replication` knows nothing about HTTP. `consistency` imports `store` and `replication` but not `cluster`. This keeps each layer testable in isolation.
+**Rule**: lower packages never import upper ones. `store` knows nothing about Raft. `replication` knows nothing about HTTP or gRPC. `consistency` imports `store` and `replication` but not `cluster`. This keeps each layer testable in isolation.
 
 ---
 
@@ -163,19 +186,24 @@ type KVEngine interface {
 
 **GC**: the GC goroutine runs on a configurable interval. The effective GC horizon is `min(replicationHorizon, oldestActivePin)`. The replication horizon advances when all followers have applied at least that version. The pin mechanism lets long-running scan transactions anchor a snapshot: GC will not collect any version at or above the pin until `UnpinVersion` is called.
 
-### `replication/` — Raft integration
+**Snapshots**: `Snapshot()` serializes the current live state (latest non-deleted version of each key) into a portable byte blob. The snapshot version is `max(gcHorizon, highest live entry version)` — this ensures the version reflects the actual applied index, not just the GC watermark (which lags behind when GC hasn't fired recently).
 
-| File                | Responsibility                                                                    |
-| ------------------- | --------------------------------------------------------------------------------- |
-| `leader.go`         | Propose writes to Raft; apply committed entries; signal waiting client goroutines |
-| `follower.go`       | Apply committed entries on non-leader nodes                                       |
-| `semisync.go`       | Wait for at least one follower ACK; increment fallbackCount on timeout            |
-| `lag.go`            | Track follower match indices; compute LagEntries and LagMs                        |
-| `raftly_adapter.go` | Bridge raftly's concrete types to the `RaftNode` interface                        |
+### `replication/` — Raft integration and log compaction
+
+| File                    | Responsibility                                                                    |
+| ----------------------- | --------------------------------------------------------------------------------- |
+| `leader.go`             | Propose writes to Raft; apply committed entries; signal waiting client goroutines |
+| `follower.go`           | Apply committed entries on non-leader nodes                                       |
+| `snapshot_manager.go`   | Periodic snapshots to disk; atomic two-phase write; crash recovery via load       |
+| `semisync.go`           | Wait for at least one follower ACK; increment fallbackCount on timeout            |
+| `lag.go`                | Track follower match indices; compute LagEntries and LagMs                        |
+| `raftly_adapter.go`     | Bridge raftly's concrete types to the `RaftNode` interface                        |
 
 **The TOCTOU race and its fix**: raftly's internal `commitCh` is buffered (capacity 256). This means `applyCommitted()` can send an entry to `commitCh` and call `notifyProposal` before `l.raft.Propose()` has returned to the caller. If `l.pending[reqID]` is registered _after_ `l.raft.Propose()` returns, `applyEntry` signals a missing pending op and the client times out. The fix: pre-register the pending op **before** calling `l.raft.Propose()`. The pending map key is `fmt.Sprintf("%p", resultCh)` — the channel pointer is unique per proposal within the process lifetime without coordination.
 
 **The mutex non-reentrancy trap**: Go's `sync.Mutex` is NOT reentrant. Calling `l.raft.Propose()` with `l.pendingMu` held causes `applyEntry` to block forever on `l.pendingMu.Lock()`. When the client's context eventually fires, `ctx.Done()` tries to re-acquire the same lock on the same goroutine — permanent deadlock, zero output. Always unlock before crossing a subsystem boundary.
+
+**Log compaction**: `SnapshotManager` runs on every node independently. Because all nodes apply the same log entries in the same order (Raft guarantee), snapshotting at index N on any node produces semantically equivalent state. No cross-node coordination needed. Snapshots use a temp-file → rename two-phase write so a crash mid-write leaves the previous snapshot intact. On startup, `LoadLatestSnapshot()` restores the engine state before the Raft apply loop starts, ensuring entries are always applied on top of a consistent baseline.
 
 ### `consistency/` — Read routing
 
@@ -190,9 +218,58 @@ Four readers, one router. `Router.Get()` dispatches to the right reader based on
 
 **Session token**: RYW uses a base64-encoded JSON struct `{nodeID, writeVersion}`, not a JWT. It encodes the Raft log index of the last write the client made. A follower that has applied at least that index can serve the read locally; one that hasn't sends back `ErrNotCaughtUp` (HTTP 503), and the client falls back to the leader.
 
+### `server/` — HTTP REST and gRPC APIs
+
+The `server` package exposes two independent APIs on the same node:
+
+**HTTP REST** (`server/server.go`, `server/api.go`)
+
+| Endpoint                | Method | Description                                                        |
+| ----------------------- | ------ | ------------------------------------------------------------------ |
+| `/v1/keys/{key}`        | PUT    | Write a value; returns `session_token` for RYW reads               |
+| `/v1/keys/{key}`        | GET    | Read with `X-Consistency` header (`strong`/`eventual`/`ryw`/`monotonic`) |
+| `/v1/keys/{key}`        | DELETE | Delete a key; redirects to leader if called on a follower          |
+| `/v1/keys`              | GET    | Range scan with `?start=&end=&limit=` query params                 |
+| `/v1/status`            | GET    | Node state, commit index, applied index, per-follower replication lag |
+| `/v1/debug/gc`          | GET    | GC stats: horizon, blocked-by-txn flag, cycles run                 |
+| `/metrics` (separate port) | GET | Prometheus text format — separate listener, never mixed with KV traffic |
+
+The `X-Consistency` middleware parses the header once and injects `ConsistencyMode` into the request context; handlers never parse headers directly. The `WithMetrics` middleware wraps every handler and records latency histograms, op counters, and stale read counts.
+
+**gRPC** (`server/kv_server.go`, `proto/kv_fabric.proto`)
+
+The `KVFabric` service is the client-facing API for `cmd/server` (the networked deployment). `kvctl` uses this API.
+
+```protobuf
+service KVFabric {
+    rpc Put(PutRequest)       returns (PutResponse);
+    rpc Get(GetRequest)       returns (GetResponse);
+    rpc Delete(DeleteRequest) returns (DeleteResponse);
+    rpc Scan(ScanRequest)     returns (ScanResponse);
+    rpc Status(StatusRequest) returns (StatusResponse);
+}
+```
+
+Non-leader nodes populate `redirect_to` in the response instead of returning a gRPC error. `kvctl` follows the redirect by prepending the leader address to its retry queue.
+
+**Prometheus metrics** (`server/metrics.go`)
+
+| Metric                              | Type      | Description                                            |
+| ----------------------------------- | --------- | ------------------------------------------------------ |
+| `kv_fabric_puts_total`              | counter   | PUT operations by consistency mode                     |
+| `kv_fabric_gets_total`              | counter   | GET operations by consistency mode                     |
+| `kv_fabric_stale_reads_total`       | counter   | Reads served from a lagging follower                   |
+| `kv_fabric_session_token_rejects_total` | counter | RYW/monotonic reads rejected — node not caught up yet  |
+| `kv_fabric_replication_lag_ms`      | gauge     | Per-follower estimated lag in milliseconds             |
+| `kv_fabric_mvcc_versions_total`     | gauge     | Total MVCC versions in engine (bloat indicator)        |
+| `kv_fabric_mvcc_gc_blocked`         | gauge     | 1 if GC is blocked by a long-running transaction       |
+| `kv_fabric_op_duration_ms`          | histogram | Latency by op type and consistency mode                |
+| `kv_fabric_semisync_fallback_total` | counter   | Semi-sync timeouts where write fell back to async      |
+| `kv_fabric_phantom_writes_total`    | counter   | Writes acknowledged but lost after leader crash        |
+
 ### `cluster/` — In-process cluster wiring
 
-`cluster.Start()` builds a 3-node cluster: temporary WAL directories, `MVCCEngine` per node, `RaftlyAdapter` per node, `LeaderReplicator` and `FollowerApplier` per node, shared `NetworkProxy` and `ChaosInjector`. Both `LeaderReplicator.Propose()` and `FollowerApplier.applyLoop()` are always running on every node; `IsLeader()` gates which path is active.
+`cluster.Start()` builds a 3-node cluster: temporary WAL directories, `MVCCEngine` per node, `RaftlyAdapter` per node, `LeaderReplicator`, `FollowerApplier`, and `SnapshotManager` per node, shared `NetworkProxy` and `ChaosInjector`. Both `LeaderReplicator.Propose()` and `FollowerApplier.applyLoop()` are always running on every node; `IsLeader()` gates which path is active.
 
 `lagLoop()` polls each node's `adapter.AppliedIndex()` every 50 ms and pushes it into the shared `ReplicationTracker`. This compensates for raftly not exposing per-follower matchIndex in its public API.
 
@@ -261,7 +338,7 @@ Shows the same money transfer twice — once without snapshot isolation (reader 
 
 ### Prerequisites
 
-- Go 1.26+
+- Go 1.21+
 - Docker (for `make docker-*`)
 - GNU Make
 
@@ -269,7 +346,7 @@ Shows the same money transfer twice — once without snapshot isolation (reader 
 
 ```bash
 make build
-# Produces: bin/scenarios  bin/benchmark  bin/kvctl
+# Produces: bin/scenarios  bin/benchmark  bin/kvctl  bin/server
 ```
 
 ### Run all failure scenarios
@@ -309,20 +386,47 @@ make test-unit
 
 The integration tests start real in-process Raft clusters. Election + apply overhead adds ~300 ms per test; `-timeout 120s` gives each test room to breathe. `-race` is mandatory — this project is all goroutines and channels.
 
-### Docker
+### Run a networked 3-node cluster (localhost)
 
 ```bash
-# Build image
-make docker-build
+make cluster-start
+# Starts 3 nodes in the background:
+#   node-1: raft=:7001  kv=:9001  log=/tmp/kv-fabric-node-1.log
+#   node-2: raft=:7002  kv=:9002  log=/tmp/kv-fabric-node-2.log
+#   node-3: raft=:7003  kv=:9003  log=/tmp/kv-fabric-node-3.log
+# WAL + snapshots: data/node-{1,2,3}/
 
-# Run all scenarios in Docker
-make docker-scenarios
+# Use kvctl against the live cluster
+./bin/kvctl put mykey myvalue --nodes localhost:9001,localhost:9002,localhost:9003
+./bin/kvctl get mykey --nodes localhost:9001,localhost:9002,localhost:9003
+./bin/kvctl status --nodes localhost:9001,localhost:9002,localhost:9003
 
-# Run the benchmark in Docker (~4 minutes)
-make docker-bench
+make cluster-stop   # send SIGTERM to all nodes
+make cluster-clean  # stop + delete data/ directories
 ```
 
-The Docker image is a two-stage build: `golang:1.26-alpine` builder (CGO_ENABLED=0, fully static binary), `alpine:3.20` runtime. The ENTRYPOINT is `./scenarios`; `make docker-scenarios` uses the default `CMD ["all"]`. `make docker-bench` overrides ENTRYPOINT to `./benchmark`.
+On startup each node loads its snapshot from disk (if one exists), then replays only the Raft log entries after the snapshot version. A node that restarts after accumulating 10 000+ entries will catch up in milliseconds rather than replaying the full log from index 0.
+
+### Run a containerised cluster (Docker)
+
+```bash
+make docker-build          # build kv-fabric:latest
+
+make docker-cluster-start  # bring up 3-node cluster (docker compose)
+                           # exposes kv ports 9001-9003 on the host
+
+make docker-cluster-stop   # stop containers, keep WAL volumes
+make docker-cluster-clean  # stop containers, delete WAL volumes
+```
+
+### Docker (in-process scenarios / benchmark)
+
+```bash
+make docker-scenarios  # run all failure scenarios inside Docker
+make docker-bench      # run the 80-run benchmark inside Docker
+```
+
+The Docker image is a two-stage build: `golang:1.21-alpine` builder (CGO_ENABLED=0, fully static binary), `alpine:3.20` runtime. The ENTRYPOINT is `./scenarios`; `make docker-scenarios` uses the default `CMD ["all"]`. `make docker-bench` overrides ENTRYPOINT to `./benchmark`.
 
 ---
 
@@ -361,7 +465,7 @@ This is expected: the mode makes no catch-up guarantee. `stale%` and `LagMs` in 
 
 **Raft log index as MVCC version number.** The version number assigned to a write is `entry.Index` — the index of the committed Raft log entry. This eliminates the need for a separate version counter or a distributed ID generator. Because all nodes apply the same entry with the same index, all engines assign the same version. Version numbers are globally ordered, monotonically increasing, and free.
 
-**`KVEngine` as an interface.** Every layer above storage (`replication`, `consistency`, HTTP) depends on `KVEngine`, not on `MVCCEngine`. This makes unit tests possible: a test can inject a fake engine without starting a Raft cluster. The consistency package's unit tests never touch Raft.
+**`KVEngine` as an interface.** Every layer above storage (`replication`, `consistency`, HTTP, gRPC) depends on `KVEngine`, not on `MVCCEngine`. This makes unit tests possible: a test can inject a fake engine without starting a Raft cluster. The consistency package's unit tests never touch Raft.
 
 **`pendingOp` keyed by `fmt.Sprintf("%p", resultCh)`.** The channel pointer is unique per proposal within the process lifetime. This avoids a coordination point for generating unique IDs, and it makes the key stable even if the Raft log index is not yet known at registration time (necessary for pre-registration before `l.raft.Propose()` returns).
 
@@ -371,6 +475,12 @@ This is expected: the mode makes no catch-up guarantee. `stale%` and `LagMs` in 
 
 **In-process cluster for scenarios and benchmarks.** InMemTransport carries real Raft consensus with zero network overhead. ChaosInjector injects the same failure modes as real hardware by intercepting messages at the NetworkProxy layer. The scenarios produce real numbers because the apply path, MVCC engine, and GC are exercised exactly as in production — just without the network RTT variable.
 
+**gRPC redirect, not server-to-server forwarding.** When a non-leader node receives a write or a strong read, it returns `redirect_to` (the leader's KV address) in the response body rather than proxying the request internally. This keeps the data path transparent: every hop is visible in client logs, latency is attributable to the correct node, and the leader's goroutine pool is not inflated by proxy connections. The client library handles retry transparently.
+
+**Snapshot version = max(gcHorizon, highest live entry version).** The snapshot version determines where Raft log replay starts after a crash recovery. Using `gcHorizon` alone is wrong: it is only advanced by GC, which runs on a 10-minute ticker and may never fire in short-lived test runs. A node that crashes before GC fires would record version 0, then replay the full log from index 0 on restart — defeating the point. Using the highest version among live entries gives the correct recovery starting point without requiring any additional tracking in the engine.
+
+**Two-phase atomic snapshot write.** `SnapshotManager.persist()` writes data to a temp file, then `os.Rename`s it to the final path. `os.Rename` is atomic on POSIX — a crash between write and rename leaves the previous snapshot intact. The meta file is written after the data file, so if you see a meta file on disk, the data file behind it is always complete.
+
 ---
 
 ## Dependencies
@@ -379,5 +489,7 @@ This is expected: the mode makes no catch-up guarantee. `stale%` and `LagMs` in 
 | ------------------------------------- | ------- | ------------------------------------------------------------------------ |
 | `github.com/ani03sha/raftly`          | v0.2.0  | Raft consensus library (leader election, log replication, commit quorum) |
 | `go.uber.org/zap`                     | v1.27.1 | Structured logging                                                       |
-| `github.com/prometheus/client_golang` | v1.23.2 | Semi-sync fallback and phantom write metrics                             |
+| `github.com/prometheus/client_golang` | v1.23.2 | Metrics: op counters, latency histograms, replication lag gauges         |
 | `github.com/spf13/cobra`              | v1.10.2 | `kvctl` CLI                                                              |
+| `google.golang.org/grpc`              | v1.80.0 | Client-facing KV API and inter-node Raft transport                       |
+| `google.golang.org/protobuf`          | v1.36.11 | Protocol Buffers for `proto/kv_fabric.proto`                            |

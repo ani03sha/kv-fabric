@@ -28,7 +28,7 @@ type mvccSnapshot struct {
 }
 
 func (s *mvccSnapshot) Data() []byte {
-	return s.Data()
+	return s.data
 }
 
 func (s *mvccSnapshot) Version() uint64 {
@@ -49,7 +49,6 @@ func (e *MVCCEngine) Snapshot() (Snapshot, error) {
 	defer e.mu.RUnlock()
 
 	snap := snapshotData{
-		Version: e.gcHorizon,
 		Entries: make([]snapshotEntry, 0, len(e.data)),
 	}
 
@@ -59,7 +58,7 @@ func (e *MVCCEngine) Snapshot() (Snapshot, error) {
 		chain.mu.RUnlock()
 
 		if latest == nil || latest.Deleted {
-			continue // key doesn't exist or was deleted
+			continue
 		}
 
 		snap.Entries = append(snap.Entries, snapshotEntry{
@@ -69,6 +68,15 @@ func (e *MVCCEngine) Snapshot() (Snapshot, error) {
 			Timestamp: latest.Timestamp,
 		})
 	}
+
+	maxVer := e.gcHorizon
+	for _, entry := range snap.Entries {
+		if entry.Version > maxVer {
+			maxVer = entry.Version
+		}
+	}
+	snap.Version = maxVer
+
 	data, err := json.Marshal(snap)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: marshal failed: %w", err)

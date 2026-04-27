@@ -78,6 +78,29 @@ func main() {
 	// ── kv-fabric layer ───────────────────────────────────────────────────────
 	adapter := replication.NewRaftlyAdapter(raftNode)
 	engine := store.NewMVCCEngine(*nodeID, 10*time.Minute)
+
+	// 10k-entry threshold: in a production workload at 10k writes/sec this fires once per second.
+	// Tune upward for lower write rates. 10-minute wall-clock interval: safety net if writes are infrequent.
+	snapMgr := replication.NewSnapshotManager(
+		*nodeID,
+		engine,
+		dir,
+		10_000,
+		10*time.Minute,
+		logger,
+	)
+	// Load snapshot BEFORE starting Raft. If the node is recovering after a crash,
+	// the engine is pre-populated here. Raft then replays only the entries after
+	// the snapshot version, not the full log from index 0.
+	snapVersion, err := snapMgr.LoadLatestSnapshot()
+	if err != nil {
+		logger.Fatal("load snapshot", zap.Error(err))
+	}
+	if snapVersion > 0 {
+		logger.Info("recovered from snapshot",
+			zap.String("node", *nodeID),
+			zap.Uint64("snapshot_version", snapVersion))
+	}
 	tracker := replication.NewReplicationTracker()
 
 	// Pre-register all nodes in the tracker so GetLag and Stats have entries.
@@ -93,6 +116,7 @@ func main() {
 	}
 
 	leaderRepl := replication.NewLeaderReplicator(*nodeID, engine, adapter, tracker, logger)
+	leaderRepl.SetSnapshotManager(snapMgr)
 
 	// ── Start in dependency order ─────────────────────────────────────────────
 	//
@@ -108,6 +132,7 @@ func main() {
 		logger.Fatal("start raft node", zap.Error(err))
 	}
 	leaderRepl.Start()
+	snapMgr.Start()
 
 	kvPeerMap := parsePeers(*kvPeers)
 	kvServer := server.NewKVServer(*nodeID, adapter, leaderRepl, engine, tracker, kvPeerMap, logger)
@@ -137,6 +162,7 @@ func main() {
 
 	logger.Info("shutting down", zap.String("id", *nodeID))
 	grpcSrv.GracefulStop()
+	snapMgr.Stop()
 	leaderRepl.Stop()
 	raftNode.Stop()
 	xport.Close()

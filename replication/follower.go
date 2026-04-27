@@ -26,6 +26,7 @@ type FollowerApplier struct {
 	raft         RaftNode
 	logger       *zap.Logger
 	appliedIndex atomic.Uint64 // the highest index this follower has applied
+	snapMgr      *SnapshotManager
 
 	stop chan struct{}
 	done chan struct{}
@@ -56,6 +57,11 @@ func (f *FollowerApplier) Start() {
 func (f *FollowerApplier) Stop() {
 	close(f.stop)
 	<-f.done
+}
+
+// Add setter (after Stop()):
+func (f *FollowerApplier) SetSnapshotManager(sm *SnapshotManager) {
+	f.snapMgr = sm
 }
 
 // Returns the highest log index this follower has applied. The leader reads this to compute replication lag
@@ -108,6 +114,11 @@ func (f *FollowerApplier) applyEntry(entry CommittedEntry) error {
 	}
 	// Record how far we have applied so the leader can track our lag.
 	f.appliedIndex.Store(entry.Index)
+
+	// Trigger snapshot if enough entries have accumulated.
+	if f.snapMgr != nil {
+		f.snapMgr.MaybeTakeSnapshot(entry.Index)
+	}
 
 	f.logger.Debug("follower: applied entry",
 		zap.String("node", f.nodeID),

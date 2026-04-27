@@ -25,6 +25,7 @@ type Node struct {
 	Engine   *store.MVCCEngine
 	Leader   *replication.LeaderReplicator
 	Follower *replication.FollowerApplier
+	SnapMgr  *replication.SnapshotManager
 	walDir   string
 }
 
@@ -103,8 +104,30 @@ func Start(logger *zap.Logger) (*Cluster, error) {
 		adapter := replication.NewRaftlyAdapter(raftNode)
 		engine := store.NewMVCCEngine(id, 10*time.Minute)
 
+		// One SnapshotManager per node. 1000-entry threshold is appropriate for
+		// scenario runs (each scenario writes ~100–500 entries). The 5-minute
+		// interval is a fallback; threshold is the hot path.
+		snapMgr := replication.NewSnapshotManager(
+			id,
+			engine,
+			walDir, // same dir as the WAL — one place to back up
+			1000,   // threshold: snapshot every 1000 applied entries
+			5*time.Minute,
+			logger,
+		)
+
+		// Load any snapshot from a previous run. For fresh nodes this is a no-op.
+		// Must happen before raftNode.Start() so the engine is populated before
+		// the first committed entry arrives.
+		if _, err := snapMgr.LoadLatestSnapshot(); err != nil {
+			return nil, fmt.Errorf("load snapshot for %s: %w", id, err)
+		}
+
 		leaderRepl := replication.NewLeaderReplicator(id, engine, adapter, tracker, logger)
 		followerAppl := replication.NewFollowerApplier(id, engine, adapter, logger)
+
+		leaderRepl.SetSnapshotManager(snapMgr)
+		followerAppl.SetSnapshotManager(snapMgr)
 
 		node := &Node{
 			ID:       id,
@@ -113,6 +136,7 @@ func Start(logger *zap.Logger) (*Cluster, error) {
 			Engine:   engine,
 			Leader:   leaderRepl,
 			Follower: followerAppl,
+			SnapMgr:  snapMgr,
 			walDir:   walDir,
 		}
 		nodes[id] = node
@@ -152,6 +176,7 @@ func Start(logger *zap.Logger) (*Cluster, error) {
 			return nil, fmt.Errorf("start raft node %s: %w", node.ID, err)
 		}
 		node.Leader.Start()
+		node.SnapMgr.Start()
 	}
 
 	// Wait for leader election before returning.
@@ -211,6 +236,7 @@ func (c *Cluster) Stop() {
 	close(c.stopLag)
 
 	for _, node := range c.Nodes {
+		node.SnapMgr.Stop()
 		node.Leader.Stop()
 		node.Raft.Stop()
 		node.Adapter.Close()

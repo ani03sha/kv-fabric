@@ -104,6 +104,7 @@ type LeaderReplicator struct {
 	done chan struct{}
 
 	semiSync *SemiSyncReplicator // nil => async mode, non-nil => semi-sync mode
+	snapMgr  *SnapshotManager    // nil => no snapshotting
 }
 
 func NewLeaderReplicator(
@@ -139,6 +140,10 @@ func (l *LeaderReplicator) Stop() {
 
 func (l *LeaderReplicator) SetSemiSync(ss *SemiSyncReplicator) {
 	l.semiSync = ss
+}
+
+func (l *LeaderReplicator) SetSnapshotManager(sm *SnapshotManager) {
+	l.snapMgr = sm
 }
 
 // Propose submits a write to Raft and blocks until it is committed and applied.
@@ -274,6 +279,11 @@ func (l *LeaderReplicator) applyEntry(entry CommittedEntry) error {
 			p.result <- result // never blocks — channel is buffered
 		}
 		l.pendingMu.Unlock()
+	}
+
+	// Trigger a snapshot if enough entries have accumulated since the last one.
+	if l.snapMgr != nil {
+		l.snapMgr.MaybeTakeSnapshot(entry.Index)
 	}
 
 	return result.err
