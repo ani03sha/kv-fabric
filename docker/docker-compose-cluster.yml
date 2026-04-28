@@ -1,3 +1,4 @@
+name: "kv-fabric"
 # kv-fabric: 3-node cluster, one container per node.
 #
 # Each node gets:

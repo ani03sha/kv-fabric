@@ -18,146 +18,27 @@ KV Fabric (or kv-fabric) is a distributed key-value store that treats consistenc
 
 ### Write path
 
-```
-Client
-  │
-  ▼
-c.Propose(ctx, KVOperation)           ← cluster.go picks the current leader
-  │
-  ▼
-LeaderReplicator.Propose()            ← replication/leader.go
-  │  1. Pre-register pendingOp keyed by reqID = fmt.Sprintf("%p", resultCh)
-  │  2. json.Marshal(KVOperation{..., RequestID: reqID})
-  │  3. raft.Propose(ctx, data)        ← submits to Raft, blocks until quorum commit
-  │  4. block on resultCh
-  │
-  ▼
-RaftlyAdapter.Propose()               ← replication/raftly_adapter.go
-  │  wraps raftly.RaftNode.Propose()
-  │  returns assigned log index
-  │
-  ▼
-Raft quorum commit
-  │  Leader + 1 follower must accept AppendEntries
-  │  Committed entry flows to all nodes via CommittedEntries() channel
-  │
-  ▼
-LeaderReplicator.applyLoop()          ← replication/leader.go
-  │  applyEntry(CommittedEntry)
-  │  → engine.Put(key, value, PutOptions{LogIndex: entry.Index})
-  │  → tracker.UpdateLeaderCommitIndex(entry.Index)
-  │  → SnapshotManager.MaybeTakeSnapshot(entry.Index)  ← log compaction trigger
-  │  → pending[op.RequestID].result <- applyResult{putResult, nil}
-  │
-  ▼
-resultCh unblocks in Propose()
-Client receives PutResult{Version: entry.Index}
-```
+![Write Path](docs/write_path.png)
 
 The Raft log index **is** the MVCC version number. Every node that applies this entry calls `engine.Put(..., LogIndex: entry.Index)`, so they all assign the same version to the same write. Same inputs, same order, same state — this is what makes the state machine consistent.
 
 ### Read path (per consistency mode)
 
-```
-Client
-  │
-  ├─ strong ──────────────────────────────────────────────────────────────┐
-  │    StrongReader (consistency/strong.go)                               │
-  │    1. readIndex = raft.CommitIndex()  ← snapshot                     │
-  │    2. raft.ConfirmLeadership(ctx)     ← nil Propose, heartbeat quorum │
-  │    3. waitForApplied(readIndex)       ← poll with exponential backoff │
-  │    4. engine.Get(key)                 ← local read, guaranteed fresh  │
-  │                                                                        │
-  ├─ eventual ─────────────────────────────────────────────────────────────┤
-  │    EventualReader (consistency/eventual.go)                           │
-  │    1. engine.Get(key)                 ← local read, zero RTT          │
-  │    2. tag IsStale, LagMs from tracker ← observability surface         │
-  │                                                                        │
-  ├─ read-your-writes ─────────────────────────────────────────────────────┤
-  │    RYWReader (consistency/readyourwrites.go)                          │
-  │    1. decode SessionToken (base64 JSON: {nodeID, writeVersion})       │
-  │    2. if raft.AppliedIndex() >= token.WriteVersion → local read       │
-  │    3. else → ErrNotCaughtUp(503) → caller falls back to leader        │
-  │                                                                        │
-  └─ monotonic ────────────────────────────────────────────────────────────┘
-       MonotonicReader (consistency/monotonic.go)
-       1. if raft.AppliedIndex() >= opts.MinVersion → local read
-       2. else → ErrNotCaughtUp(503) → caller falls back to leader
-       (watermark lives in the client; server is stateless)
-```
+![Read Path](docs/read_path.png)
 
 ### Cluster topology
 
 **In-process (scenarios and benchmarks)**
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                          OS process                                    │
-│                                                                        │
-│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐               │
-│  │   node-1     │   │   node-2     │   │   node-3     │               │
-│  │  (leader)    │   │  (follower)  │   │  (follower)  │               │
-│  │              │   │              │   │              │               │
-│  │ MVCCEngine   │   │ MVCCEngine   │   │ MVCCEngine   │               │
-│  │ LeaderRepl   │   │ LeaderRepl   │   │ LeaderRepl   │               │
-│  │ SnapManager  │   │ SnapManager  │   │ SnapManager  │               │
-│  │ RaftlyAdapter│   │ RaftlyAdapter│   │ RaftlyAdapter│               │
-│  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘               │
-│         │                  │                  │                        │
-│         └──────────────────┴──────────────────┘                        │
-│                    InMemTransport / NetworkProxy                        │
-│                    (ChaosInjector intercepts here)                      │
-└────────────────────────────────────────────────────────────────────────┘
-```
+![In Process Cluster Topology](docs/in-process-cluster-topology.png)
 
 **Networked (`make cluster-start` / `make docker-cluster-start`)**
 
-```
-  kvctl (gRPC client)
-     │  :9001 / :9002 / :9003
-     │
-     ▼
-┌──────────────┐   Raft gRPC   ┌──────────────┐   Raft gRPC   ┌──────────────┐
-│   node-1     │◄─────────────►│   node-2     │◄─────────────►│   node-3     │
-│  :7001 raft  │               │  :7002 raft  │               │  :7003 raft  │
-│  :9001 kv    │               │  :9002 kv    │               │  :9003 kv    │
-│              │               │              │               │              │
-│ GRPCTransport│               │ GRPCTransport│               │ GRPCTransport│
-│ MVCCEngine   │               │ MVCCEngine   │               │ MVCCEngine   │
-│ LeaderRepl   │               │ LeaderRepl   │               │ LeaderRepl   │
-│ SnapManager  │               │ SnapManager  │               │ SnapManager  │
-│ KVServer     │               │ KVServer     │               │ KVServer     │
-└──────────────┘               └──────────────┘               └──────────────┘
-   data/node-1/                  data/node-2/                  data/node-3/
-   (WAL + snapshots)             (WAL + snapshots)             (WAL + snapshots)
-```
+![Networked Cluster Topology](docs/networked-cluster-topology.png)
 
 Non-leader nodes return a `redirect_to` address in the gRPC response. `kvctl` follows the redirect and retries against the leader — no internal server-to-server forwarding, which keeps traces unambiguous.
 
-InMemTransport carries real Raft consensus — elections, log replication, commit quorum — with zero network overhead. ChaosInjector injects the same failure modes (crash, partition, lag) that happen on real hardware by intercepting messages at the NetworkProxy layer.
-
----
-
-## Package dependency graph
-
-```
-cmd/scenarios  cmd/benchmark  cmd/kvctl  cmd/server
-      │               │            │          │
-      └───────┬────────┘            │          │
-              ▼                     ▼          ▼
-           cluster              client      server ──── proto/
-              │                                │
-              ▼                                │
-        replication ◄──────────────── consistency
-              │                                │
-              ▼                                │
-            store ◄─────────────────────────────┘
-              │
-              ▼
-         raftly (external: github.com/ani03sha/raftly)
-```
-
-**Rule**: lower packages never import upper ones. `store` knows nothing about Raft. `replication` knows nothing about HTTP or gRPC. `consistency` imports `store` and `replication` but not `cluster`. This keeps each layer testable in isolation.
+`InMemTransport` carries real Raft consensus including elections, log replication, commit quorum with zero network overhead. `ChaosInjector` injects the same failure modes (crash, partition, lag) that happen on real hardware by intercepting messages at the `NetworkProxy` layer.
 
 ---
 
