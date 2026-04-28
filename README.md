@@ -1,30 +1,96 @@
 # KV Fabric
 
-KV Fabric (or kv-fabric) is a distributed key-value store that treats consistency as a **measurable engineering tradeoff**, not a binary switch. Every read in **kv-fabric** carries a consistency mode, and the benchmark harness produces hard numbers for what each mode costs.
+When we replicate data across three machines, every read becomes asks this question: _which copy is right?_
 
-**What this project proves:**
+The answer depends on what we are willing to pay. A bank balance needs the latest value, always - even if that costs an extra network round-trip. A user's profile picture can be a few hundred milliseconds stale - pay nothing, serve it from the nearest node. Most systems pick one answer and apply it everywhere. That's the wrong call.
 
-| Claim                                               | How it is proven                                                       |
-| --------------------------------------------------- | ---------------------------------------------------------------------- |
-| Linearizable reads cost a full Raft RTT             | `strong` vs `eventual` throughput in `make bench`                      |
-| Semi-sync replication has a phantom durability trap | `make scenario-phantom` crashes the leader and shows the missing write |
-| A 340 ms follower lag causes double-bookings        | `make scenario-booking` reproduces the race with real network delay    |
-| MVCC version accumulation bloats memory             | `make scenario-mvcc-bloat` shows version counts before and after GC    |
-| MVCC prevents dirty reads                           | `make scenario-dirty-read` shows snapshot isolation end-to-end         |
+**kv-fabric** is a distributed key-value store that makes consistency a per-request choice, with a benchmark harness that measures exactly what each choice costs. The four failure scenarios included are not contrived edge cases. They are the actual production bugs that took down real systems.
 
 ---
 
-## Architecture
+## The core concept: consistency is a spectrum
+
+When we write a value to this cluster, Raft replicates it to a majority of nodes before returning success. A write is durable: that means a quorum of machines has it, but the other nodes might not have applied it yet. When a client reads that value 50 ms later, what should it see?
+
+***kv-fabric*** answers this question four ways, and lets us measure the trade-off of each:
+
+| Mode               | The guarantee       | The plain-English version                                                          | What it costs                                                                |
+| ------------------ | ------------------- | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `strong`           | Linearizable        | We always see the most recent write, period                                       | One Raft round-trip per read: the leader must confirm it's still the leader  |
+| `eventual`         | Best-effort         | We might see data that's a few hundred milliseconds stale                         | Nothing: read from the nearest node, zero network overhead                  |
+| `read-your-writes` | Session consistency | We always see our own writes; others might see an older version                  | Nothing on a caught-up follower; one round-trip if we land on a lagging one |
+| `monotonic`        | Monotonic reads     | Time never goes backward - we will never see version 5 after we have seen version 10 | Nothing on a caught-up follower; one round-trip to the leader otherwise      |
+
+The benchmark (`make bench`) runs all four modes across five workloads and four concurrency levels and produces a table of ops/sec, $p50/p99$ latency, and stale-read percentage. The numbers are real - the cluster is real, the Raft consensus is real, the only thing missing is network latency.
+
+---
+
+## Four failure modes, four lessons
+
+These scenarios are runnable. Each one starts a real in-process Raft cluster, injects a real failure, and prints the evidence. If we Run them in order, each one teaches a different lesson about what goes wrong when we get consistency wrong.
+
+### 1. The phantom write (`make scenario-phantom`)
+
+**Failure**: We write a value. The server says "success." We crash the server. The value never existed.
+
+This is the semi-synchronous replication trap. "Semi-sync" means: wait for at least one follower to acknowledge before returning success. The problem is the fallback. If no follower responds within the timeout, the leader returns success anyway  because blocking forever is worse than losing data. At that moment, the write exists only on the leader's log. If the leader crashes before a follower catches up, the write is gone.
+
+The scenario sets the semi-sync timeout to 10 ms (shorter than the follower lag polling interval), writes a key, crashes the leader, waits for a new leader to be elected, and reads the key. It's gone. `kv_fabric_semisync_fallback_total` and `kv_fabric_phantom_writes_total` Prometheus counters show exactly when and how often this happens.
+
+**Lesson**: `fallbackCount > 0` in our metrics when a leader dies is a guarantee of data loss. If our durability requirement is absolute, we need synchronous replication, not semi-sync with a fallback.
+
+### 2. The double-booking (`make scenario-booking`)
+
+**Failure**: Two users book the last seat on a flight. Both get confirmation emails. The plane is oversold.
+
+This happens when we read availability from a follower that hasn't caught up to the latest writes. The scenario injects 340 ms of artificial lag on one follower's replication stream, then issues two concurrent seat-booking reads from that follower. Both see `seats=1`. Both book. Inventory drops to `seats=-1`.
+
+The scenario demonstrates two fixes, and both are valid:
+
+- **Fix A - strong reads**: Route the availability check to the leader with `ConsistencyStrong`. The leader confirms it is still the leader before reading, so it always sees the latest inventory.
+- **Fix B - optimistic concurrency**: Use `PutOptions{IfVersion: v}`. The second booking fails with a version conflict (someone else already changed the inventory) and retries. This works without touching the leader as the storage engine enforces it.
+
+**Lesson**: eventual consistency is correct for many use cases, but "does this seat exist?" is not one of them. The right fix is not "use strong everywhere" but to "use strong where staleness has real consequences."
+
+### 3. The MVCC memory leak (`make scenario-mvcc-bloat`)
+
+**Failure**: A long-running analytics query slowly freezes our garbage collector. Memory climbs until the process OOMs.
+
+MVCC (Multi-Version Concurrency Control) works by keeping old versions of data alive instead of overwriting them. This is what enables consistent snapshot reads: a transaction that started at version 100 will always see the world as it was at version 100, even as newer writes accumulate. But if a transaction holds its snapshot open indefinitely, the garbage collector cannot reclaim anything newer than that snapshot. Memory grows without bound.
+
+The scenario shows the three-phase lifecycle: accumulate 500 versions of a hot key -> an analytics transaction pins version 300 -> the GC horizon freezes at 300 even as the commit index advances to 490 -> the analytics job finishes, unpins -> GC reclaims 300–489 in one pass.
+
+`kv_fabric_mvcc_gc_blocked=1` is the production signal. `TotalVersions / TotalKeys` is the bloat ratio to alert on.
+
+**Lesson**: MVCC is not free. The price is that long-running transactions hold old versions hostage. Every storage system that uses MVCC (Postgres, MySQL InnoDB, CockroachDB) has this problem. The fix is a maximum transaction age with a hard timeout.
+
+### 4. The dirty read (`make scenario-dirty-read`)
+
+**Failure**: A money transfer moves $200 from Alice to Bob. A concurrent reader catches Alice's account debited but Bob's not yet credited. $200 has temporarily vanished from the world.
+
+Without snapshot isolation, a reader between two writes in the same logical operation sees intermediate state. The scenario transfers $200 across two accounts and reads both in between. Without isolation: Alice has $800, Bob has $1000, total is $1800 instead of $2000. $200 is missing.
+
+With MVCC snapshot isolation (`GetAtVersion`), the reader pins the pre-transfer version. No matter when it reads, it sees Alice at $1000 and Bob at $1000. The total is always $2000.
+
+**Lesson**: transactions exist to make multi-write operations appear atomic to readers. MVCC implements this without locking, readers and writers never block each other, because each version of a value is immutable once written.
+
+---
+
+## How it is built
 
 ### Write path
 
 ![Write Path](docs/write_path.png)
 
-The Raft log index **is** the MVCC version number. Every node that applies this entry calls `engine.Put(..., LogIndex: entry.Index)`, so they all assign the same version to the same write. Same inputs, same order, same state — this is what makes the state machine consistent.
+Every write goes through the Raft leader. The leader appends it to the distributed log, waits for a quorum of nodes to acknowledge it (that's the durability guarantee), then applies it to the local storage engine. Every follower applies the same entry in the same order.
+
+The most important design decision is that **the Raft log index is the MVCC version number**. Entry at index 5000 is version 5000, on every node, always. This eliminates the need for a separate version counter, a distributed ID generator, or any coordination. Same inputs, same order, same version - that's what makes the state machine consistent.
 
 ### Read path (per consistency mode)
 
 ![Read Path](docs/read_path.png)
+
+Writes always go to the leader. Reads go wherever the consistency mode allows. Strong reads require a heartbeat quorum (expensive). Eventual reads are purely local (free). RYW and monotonic reads are local when the node is caught up, and fall back to the leader when it isn't - this is the "pay nothing on the happy path" property that makes session consistency practical.
 
 ### Cluster topology
 
@@ -32,21 +98,27 @@ The Raft log index **is** the MVCC version number. Every node that applies this 
 
 ![In Process Cluster Topology](docs/in-process-cluster-topology.png)
 
+Scenarios and benchmarks use an in-process cluster: three Raft nodes in one OS process, communicating over Go channels instead of a network. This is not a simulation: the Raft leader election, log replication, and commit quorum are all real. `ChaosInjector` intercepts messages at the transport layer and injects drops, delays, and partitions. The numbers are real; only the network RTT is absent.
+
 **Networked (`make cluster-start` / `make docker-cluster-start`)**
 
 ![Networked Cluster Topology](docs/networked-cluster-topology.png)
 
-Non-leader nodes return a `redirect_to` address in the gRPC response. `kvctl` follows the redirect and retries against the leader — no internal server-to-server forwarding, which keeps traces unambiguous.
+The `cmd/server` binary runs as a real network process. Three nodes communicate over gRPC: one port for inter-node Raft (`--raft-addr`), one for client traffic (`--kv-addr`). `kvctl` is the CLI client: it connects to any node and follows redirects to the leader automatically.
 
-`InMemTransport` carries real Raft consensus including elections, log replication, commit quorum with zero network overhead. `ChaosInjector` injects the same failure modes (crash, partition, lag) that happen on real hardware by intercepting messages at the `NetworkProxy` layer.
+Non-leader nodes return a `redirect_to` address in the gRPC response. The client follows the redirect and retries. There is no internal server-to-server forwarding - every hop is visible in client logs and latency is attributable to the correct node.
 
 ---
 
-## Packages
+## Package structure
 
-### `store/` — MVCC storage engine
+![Project Structure](docs/project_structure.png)
 
-The core storage contract is `KVEngine`:
+Lower packages never import upper ones. `store` knows nothing about Raft. `replication` knows nothing about HTTP or gRPC. This keeps each layer independently testable.
+
+### `store/` - Multi-version storage engine
+
+The storage layer implements one contract:
 
 ```go
 type KVEngine interface {
@@ -61,157 +133,81 @@ type KVEngine interface {
 }
 ```
 
-`MVCCEngine` implements this. Each `Put` appends a new `Version` to the key's chain; old versions are never overwritten. This is what enables snapshot reads and prevents dirty reads.
+`MVCCEngine` keeps every write as a new `Version` in the key's chain. Old versions are never overwritten in place. This is what prevents dirty reads and enables point-in-time reads. GC runs on a configurable interval and reclaims versions older than `min(replicationHorizon, oldestActiveTransactionPin)`.
 
-**Version numbering**: when `PutOptions.LogIndex` is non-zero (the replication path), the engine uses the Raft log index as the version number. When zero (unit tests), it uses an internal monotonic counter. Because every node applies the same log entry with the same index, every node assigns the same version to the same write. Consistency without coordination.
+### `replication/` - Raft integration and log compaction
 
-**GC**: the GC goroutine runs on a configurable interval. The effective GC horizon is `min(replicationHorizon, oldestActivePin)`. The replication horizon advances when all followers have applied at least that version. The pin mechanism lets long-running scan transactions anchor a snapshot: GC will not collect any version at or above the pin until `UnpinVersion` is called.
+| File                  | What it does                                                                   |
+| --------------------- | ------------------------------------------------------------------------------ |
+| `leader.go`           | Proposes writes to Raft; wakes client goroutines when their entry is committed |
+| `follower.go`         | Applies the same committed entries on non-leader nodes                         |
+| `snapshot_manager.go` | Periodically saves engine state to disk; restores it on startup                |
+| `semisync.go`         | Optionally waits for a follower ACK; counts timeouts as fallbacks              |
+| `lag.go`              | Tracks how far each follower is behind the leader                              |
+| `raftly_adapter.go`   | Adapts the external raftly library to kv-fabric's `RaftNode` interface         |
 
-**Snapshots**: `Snapshot()` serializes the current live state (latest non-deleted version of each key) into a portable byte blob. The snapshot version is `max(gcHorizon, highest live entry version)` — this ensures the version reflects the actual applied index, not just the GC watermark (which lags behind when GC hasn't fired recently).
+**Log compaction**: without snapshots, a restarting node must replay every Raft entry ever committed to reconstruct its state. A node that has processed one million entries would take seconds to restart. `SnapshotManager` solves this by periodically serializing the engine's current state to disk. On startup, the node loads the snapshot first (fast), then replays only the entries that arrived after the snapshot was taken (a small delta). Snapshots use a temp-file → rename two-phase write: `os.Rename` is atomic on POSIX, so a crash mid-write always leaves the previous snapshot intact.
 
-### `replication/` — Raft integration and log compaction
+### `consistency/` - Read routing
 
-| File                    | Responsibility                                                                    |
-| ----------------------- | --------------------------------------------------------------------------------- |
-| `leader.go`             | Propose writes to Raft; apply committed entries; signal waiting client goroutines |
-| `follower.go`           | Apply committed entries on non-leader nodes                                       |
-| `snapshot_manager.go`   | Periodic snapshots to disk; atomic two-phase write; crash recovery via load       |
-| `semisync.go`           | Wait for at least one follower ACK; increment fallbackCount on timeout            |
-| `lag.go`                | Track follower match indices; compute LagEntries and LagMs                        |
-| `raftly_adapter.go`     | Bridge raftly's concrete types to the `RaftNode` interface                        |
+`Router.Get()` dispatches each read to the right reader based on the consistency mode. The router never touches Raft directly - it delegates to four focused reader types:
 
-**The TOCTOU race and its fix**: raftly's internal `commitCh` is buffered (capacity 256). This means `applyCommitted()` can send an entry to `commitCh` and call `notifyProposal` before `l.raft.Propose()` has returned to the caller. If `l.pending[reqID]` is registered _after_ `l.raft.Propose()` returns, `applyEntry` signals a missing pending op and the client times out. The fix: pre-register the pending op **before** calling `l.raft.Propose()`. The pending map key is `fmt.Sprintf("%p", resultCh)` — the channel pointer is unique per proposal within the process lifetime without coordination.
+- **`StrongReader`**: takes the current commit index, sends a heartbeat quorum to confirm leadership, waits for applied ≥ commit index, reads local engine
+- **`EventualReader`**: reads local engine, tags result with `IsStale=true` and `LagMs` if the node is behind
+- **`RYWReader`**: decodes a session token (base64 JSON: `{nodeID, writeVersion}`), checks `appliedIndex ≥ writeVersion`, reads local or falls back to leader
+- **`MonotonicReader`**: checks `appliedIndex ≥ opts.MinVersion` (a client-side watermark), reads local or falls back to leader
 
-**The mutex non-reentrancy trap**: Go's `sync.Mutex` is NOT reentrant. Calling `l.raft.Propose()` with `l.pendingMu` held causes `applyEntry` to block forever on `l.pendingMu.Lock()`. When the client's context eventually fires, `ctx.Done()` tries to re-acquire the same lock on the same goroutine — permanent deadlock, zero output. Always unlock before crossing a subsystem boundary.
+### `server/` - HTTP REST and gRPC APIs
 
-**Log compaction**: `SnapshotManager` runs on every node independently. Because all nodes apply the same log entries in the same order (Raft guarantee), snapshotting at index N on any node produces semantically equivalent state. No cross-node coordination needed. Snapshots use a temp-file → rename two-phase write so a crash mid-write leaves the previous snapshot intact. On startup, `LoadLatestSnapshot()` restores the engine state before the Raft apply loop starts, ensuring entries are always applied on top of a consistent baseline.
+Two independent APIs on the same node:
 
-### `consistency/` — Read routing
+**HTTP REST:** used by the in-process cluster and direct HTTP clients
 
-Four readers, one router. `Router.Get()` dispatches to the right reader based on `GetOptions.Consistency`. Each reader may fall back to the leader (`leaderRouter`) when the local node is behind the required version.
+| Endpoint                   | Method | Notes                                                  |
+| -------------------------- | ------ | ------------------------------------------------------ |
+| `/v1/keys/{key}`           | PUT    | Returns `session_token` for subsequent RYW reads       |
+| `/v1/keys/{key}`           | GET    | Consistency via `X-Consistency` header                 |
+| `/v1/keys`                 | GET    | Range scan: `?start=&end=&limit=`                      |
+| `/v1/status`               | GET    | Node state, commit index, replication lag per follower |
+| `/v1/debug/gc`             | GET    | GC horizon, blocked-by-txn flag, cycle count           |
+| `/metrics` (separate port) | GET    | Prometheus text format                                 |
 
-| Mode               | Guarantee               | Mechanism                                                            | Cost                                          |
-| ------------------ | ----------------------- | -------------------------------------------------------------------- | --------------------------------------------- |
-| `strong`           | Linearizable            | ReadIndex: heartbeat quorum, then local read                         | 1 Raft RTT per read                           |
-| `eventual`         | Best-effort staleness   | Local engine read, tagged with `IsStale`/`LagMs`                     | Zero network overhead                         |
-| `read-your-writes` | See your own writes     | Session token carries `writeVersion`; compare against `appliedIndex` | Zero on warm follower; 1 RTT on fallback      |
-| `monotonic`        | Reads never go backward | Client-side watermark; compare against `appliedIndex`                | Zero on caught-up follower; 1 RTT on fallback |
-
-**Session token**: RYW uses a base64-encoded JSON struct `{nodeID, writeVersion}`, not a JWT. It encodes the Raft log index of the last write the client made. A follower that has applied at least that index can serve the read locally; one that hasn't sends back `ErrNotCaughtUp` (HTTP 503), and the client falls back to the leader.
-
-### `server/` — HTTP REST and gRPC APIs
-
-The `server` package exposes two independent APIs on the same node:
-
-**HTTP REST** (`server/server.go`, `server/api.go`)
-
-| Endpoint                | Method | Description                                                        |
-| ----------------------- | ------ | ------------------------------------------------------------------ |
-| `/v1/keys/{key}`        | PUT    | Write a value; returns `session_token` for RYW reads               |
-| `/v1/keys/{key}`        | GET    | Read with `X-Consistency` header (`strong`/`eventual`/`ryw`/`monotonic`) |
-| `/v1/keys/{key}`        | DELETE | Delete a key; redirects to leader if called on a follower          |
-| `/v1/keys`              | GET    | Range scan with `?start=&end=&limit=` query params                 |
-| `/v1/status`            | GET    | Node state, commit index, applied index, per-follower replication lag |
-| `/v1/debug/gc`          | GET    | GC stats: horizon, blocked-by-txn flag, cycles run                 |
-| `/metrics` (separate port) | GET | Prometheus text format — separate listener, never mixed with KV traffic |
-
-The `X-Consistency` middleware parses the header once and injects `ConsistencyMode` into the request context; handlers never parse headers directly. The `WithMetrics` middleware wraps every handler and records latency histograms, op counters, and stale read counts.
-
-**gRPC** (`server/kv_server.go`, `proto/kv_fabric.proto`)
-
-The `KVFabric` service is the client-facing API for `cmd/server` (the networked deployment). `kvctl` uses this API.
+**gRPC:** used by `cmd/server` and `kvctl`
 
 ```protobuf
 service KVFabric {
-    rpc Put(PutRequest)       returns (PutResponse);
-    rpc Get(GetRequest)       returns (GetResponse);
+    rpc Put(PutRequest)       returns (PutResponse);    // redirect_to if not leader
+    rpc Get(GetRequest)       returns (GetResponse);    // redirect_to on ErrNotCaughtUp
     rpc Delete(DeleteRequest) returns (DeleteResponse);
     rpc Scan(ScanRequest)     returns (ScanResponse);
     rpc Status(StatusRequest) returns (StatusResponse);
 }
 ```
 
-Non-leader nodes populate `redirect_to` in the response instead of returning a gRPC error. `kvctl` follows the redirect by prepending the leader address to its retry queue.
+**Prometheus metrics**
 
-**Prometheus metrics** (`server/metrics.go`)
-
-| Metric                              | Type      | Description                                            |
-| ----------------------------------- | --------- | ------------------------------------------------------ |
-| `kv_fabric_puts_total`              | counter   | PUT operations by consistency mode                     |
-| `kv_fabric_gets_total`              | counter   | GET operations by consistency mode                     |
-| `kv_fabric_stale_reads_total`       | counter   | Reads served from a lagging follower                   |
-| `kv_fabric_session_token_rejects_total` | counter | RYW/monotonic reads rejected — node not caught up yet  |
-| `kv_fabric_replication_lag_ms`      | gauge     | Per-follower estimated lag in milliseconds             |
-| `kv_fabric_mvcc_versions_total`     | gauge     | Total MVCC versions in engine (bloat indicator)        |
-| `kv_fabric_mvcc_gc_blocked`         | gauge     | 1 if GC is blocked by a long-running transaction       |
-| `kv_fabric_op_duration_ms`          | histogram | Latency by op type and consistency mode                |
-| `kv_fabric_semisync_fallback_total` | counter   | Semi-sync timeouts where write fell back to async      |
-| `kv_fabric_phantom_writes_total`    | counter   | Writes acknowledged but lost after leader crash        |
-
-### `cluster/` — In-process cluster wiring
-
-`cluster.Start()` builds a 3-node cluster: temporary WAL directories, `MVCCEngine` per node, `RaftlyAdapter` per node, `LeaderReplicator`, `FollowerApplier`, and `SnapshotManager` per node, shared `NetworkProxy` and `ChaosInjector`. Both `LeaderReplicator.Propose()` and `FollowerApplier.applyLoop()` are always running on every node; `IsLeader()` gates which path is active.
-
-`lagLoop()` polls each node's `adapter.AppliedIndex()` every 50 ms and pushes it into the shared `ReplicationTracker`. This compensates for raftly not exposing per-follower matchIndex in its public API.
-
-### `scenarios/` — Documented failure modes
-
-| Scenario             | What it demonstrates                                                                                         |
-| -------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `phantom_durability` | Semi-sync fallback trap: write acknowledged by leader, falls back to async, leader crashes, write is gone    |
-| `booking_com`        | Stale read leads to double-booking: follower 340 ms behind confirms available seats that were already taken  |
-| `mvcc_bloat`         | Version accumulation: hot key at high write rate, pin blocking GC horizon, GC reclaims after unpin           |
-| `dirty_read`         | Snapshot isolation: MVCC prevents a concurrent reader from seeing intermediate state of a two-write transfer |
-
-### `benchmark/` — 80-run measurement harness
-
-Five workloads × four consistency modes × four concurrency levels = 80 runs. Each run lasts 3 seconds. The cluster is started once and reused — restarting per run would add ~300 ms of election overhead, turning a 4-minute benchmark into a 40-minute one.
-
-| Workload      | Write% | Read% | Scan% | What it shows                                                                           |
-| ------------- | ------ | ----- | ----- | --------------------------------------------------------------------------------------- |
-| `write-only`  | 100    | 0     | 0     | Raft pipeline saturation; all modes have identical throughput (mode only affects reads) |
-| `read-heavy`  | 5      | 95    | 0     | ReadIndex tax: every strong read is a Raft proposal                                     |
-| `mixed`       | 50     | 50    | 0     | RYW and monotonic catch-up retry overhead under write pressure                          |
-| `scan-heavy`  | 10     | 10    | 80    | Scans are always eventual; strong and eventual converge                                 |
-| `write-heavy` | 80     | 20    | 0     | High write pressure keeps followers behind; eventual shows highest stale rate           |
-
-Worker goroutines maintain per-goroutine session state (`lastWriteVersion`, `watermark`), mirroring real client behavior. Servers are stateless; any node can serve any request.
+| Metric                              | Type      | What to alert on                                                |
+| ----------------------------------- | --------- | --------------------------------------------------------------- |
+| `kv_fabric_semisync_fallback_total` | counter   | > 0 means writes may be lost if the leader crashes now          |
+| `kv_fabric_phantom_writes_total`    | counter   | > 0 means data loss has already occurred                        |
+| `kv_fabric_replication_lag_ms`      | gauge     | > 500 ms means stale-read risk is high                          |
+| `kv_fabric_mvcc_gc_blocked`         | gauge     | = 1 means memory is growing; find the stuck transaction         |
+| `kv_fabric_mvcc_versions_total`     | gauge     | `versions / keys > 10` is a bloat signal                        |
+| `kv_fabric_stale_reads_total`       | counter   | Baseline for how often eventual reads are actually stale        |
+| `kv_fabric_op_duration_ms`          | histogram | p99 spike on `strong` reads = leader is under election pressure |
 
 ---
 
-## Failure scenarios in depth
+## Interesting engineering problems encountered
 
-### Phantom durability (`make scenario-phantom`)
+These are bugs that were real, not hypothetical. They showed up while building this.
 
-**Setup**: semi-sync replication with a 10 ms timeout. The timeout is intentionally shorter than the 50 ms lagLoop polling interval, so the tracker almost never shows a follower ACK in time.
+**The pre-registration race** (`replication/leader.go`): [raftly](https://github.com/ani03sha/raftly)'s commit channel is buffered. A committed entry can arrive at the apply loop _before_ `raft.Propose()` returns to the caller. If the pending-op map entry is registered after `Propose()`, the apply loop processes the entry, finds no pending op, and the client times out. 
+*Fix:* register the pending op with `fmt.Sprintf("%p", resultCh)` as the key _before_ calling `Propose()`. The channel pointer is unique per proposal for the process lifetime — no coordination needed.
 
-**The trap**: `SemiSyncReplicator.WaitForAck()` polls follower matchIndex every 5 ms. When the timeout fires, `fallbackCount` increments and the leader returns success to the client anyway. At this exact moment the write exists only on the leader's log. The scenario then calls `chaos.CrashNode(leaderID)`, waits for re-election, and reads the key from the new leader's engine. The key is gone. `phantomCount` increments. The client received a success response for a write that no longer exists anywhere.
+**The deadlock** (`replication/leader.go`): calling `raft.Propose()` while holding `pendingMu` causes the apply loop to block on `pendingMu.Lock()` inside `applyEntry`. The client's context deadline fires and tries to re-acquire the same lock on the same goroutine - permanent deadlock, zero CPU, zero output. Go's `sync.Mutex` is not reentrant. Always release locks before calling into another subsystem.
 
-**The observable signal**: `kv_fabric_semisync_fallback_total` and `kv_fabric_phantom_writes_total` Prometheus counters. If `fallbackCount > 0` when a leader dies, expect phantom writes in the post-mortem.
-
-### Booking.com double-booking (`make scenario-booking`)
-
-**Setup**: a `transport.ProxyRule` with `ActionDelay` and `delay_ms: 340` is applied to all AppendEntries messages destined for one follower. This puts that follower 340 ms behind the leader.
-
-**Path A (the bug)**: two concurrent clients both read seat availability from the lagging follower. Both see `seats=1`. Both book. The second booking overwrites the first. Inventory goes to `seats=-1`. This is a stale read leading to a lost update.
-
-**Fix A**: route availability reads to the leader with `ConsistencyStrong`. ConfirmLeadership ensures the read reflects all committed writes.
-
-**Fix B**: use optimistic concurrency — `PutOptions{IfVersion: v}`. The second writer's `IfVersion` check fails because the first writer already incremented the version. The second writer gets a conflict error and retries.
-
-### MVCC bloat (`make scenario-mvcc-bloat`)
-
-Shows the three-phase lifecycle of MVCC memory pressure:
-
-1. **Accumulate**: 500 writes to a hot key → 500 versions in memory; no GC yet
-2. **Pin**: an analytics transaction calls `PinVersion(key, 300)`; the GC horizon is clamped to 300 even after the replication horizon advances to 490
-3. **Unpin**: the analytics job finishes; the GC horizon is now free to advance to 490; GC collects 300–489
-
-**Production alert thresholds**: `TotalVersions / TotalKeys > N` (version bloat ratio); `OldestPinnedVersion` older than N minutes (stuck transaction).
-
-### Dirty read / snapshot isolation (`make scenario-dirty-read`)
-
-Shows the same money transfer twice — once without snapshot isolation (reader sees intermediate state, $200 disappears) and once with `GetAtVersion` pinning the pre-transfer snapshot (reader always sees a consistent view, total is always $1500).
+**The snapshot version bug** (`store/snapshot.go`): snapshots use `gcHorizon` as their version number: the point up to which garbage collection has run. But GC runs on a 10-minute ticker. A node that crashes before GC fires would store snapshot version 0, then replay the entire Raft log from index 0 on restart. Fix: snapshot version = `max(gcHorizon, highest live entry version)`. The highest live version is the actual applied index for the state we captured.
 
 ---
 
@@ -223,154 +219,89 @@ Shows the same money transfer twice — once without snapshot isolation (reader 
 - Docker (for `make docker-*`)
 - GNU Make
 
-### Build
+### Build everything
 
 ```bash
 make build
 # Produces: bin/scenarios  bin/benchmark  bin/kvctl  bin/server
 ```
 
-### Run all failure scenarios
+### See the failure scenarios
 
 ```bash
-make scenarios
-# Equivalent: ./bin/scenarios all
-# Runs: phantom → booking → mvcc-bloat → dirty-read
-```
-
-Run a single scenario:
-
-```bash
-make scenario-phantom
-make scenario-booking
-make scenario-mvcc-bloat
-make scenario-dirty-read
+make scenarios              # run all four in sequence (~2 minutes)
+make scenario-phantom       # just the phantom write
+make scenario-booking       # just the double-booking
+make scenario-mvcc-bloat    # just the memory bloat
+make scenario-dirty-read    # just the dirty read
 ```
 
 ### Run the benchmark
 
 ```bash
 make bench
-# 80 runs × 3s = ~4 minutes
-# Prints a markdown table + summary to stdout
+# 80 runs × 3 seconds = ~4 minutes
+# Prints ops/sec, p50/p99 latency, stale-read% for each combination
 ```
 
-### Run tests
+### Run the tests
 
 ```bash
-# Integration tests: real 3-node clusters, data race detector
-make test
-
-# Unit tests: store/, replication/, consistency/ in isolation
-make test-unit
+make test        # integration: real 3-node clusters with -race detector
+make test-unit   # unit: store/, replication/, consistency/ in isolation
 ```
 
-The integration tests start real in-process Raft clusters. Election + apply overhead adds ~300 ms per test; `-timeout 120s` gives each test room to breathe. `-race` is mandatory — this project is all goroutines and channels.
-
-### Run a networked 3-node cluster (localhost)
+### Start a live cluster
 
 ```bash
 make cluster-start
-# Starts 3 nodes in the background:
-#   node-1: raft=:7001  kv=:9001  log=/tmp/kv-fabric-node-1.log
-#   node-2: raft=:7002  kv=:9002  log=/tmp/kv-fabric-node-2.log
-#   node-3: raft=:7003  kv=:9003  log=/tmp/kv-fabric-node-3.log
-# WAL + snapshots: data/node-{1,2,3}/
+# Three nodes start in the background on localhost:
+#   node-1  raft=:7001  kv=:9001
+#   node-2  raft=:7002  kv=:9002
+#   node-3  raft=:7003  kv=:9003
 
-# Use kvctl against the live cluster
 ./bin/kvctl put mykey myvalue --nodes localhost:9001,localhost:9002,localhost:9003
-./bin/kvctl get mykey --nodes localhost:9001,localhost:9002,localhost:9003
-./bin/kvctl status --nodes localhost:9001,localhost:9002,localhost:9003
+./bin/kvctl get mykey         --nodes localhost:9001,localhost:9002,localhost:9003
+./bin/kvctl status            --nodes localhost:9001,localhost:9002,localhost:9003
 
-make cluster-stop   # send SIGTERM to all nodes
-make cluster-clean  # stop + delete data/ directories
+make cluster-stop    # graceful shutdown
+make cluster-clean   # shutdown + delete WAL data
 ```
 
-On startup each node loads its snapshot from disk (if one exists), then replays only the Raft log entries after the snapshot version. A node that restarts after accumulating 10 000+ entries will catch up in milliseconds rather than replaying the full log from index 0.
+When a node restarts, it loads its most recent snapshot from disk first, then replays only the Raft log entries that arrived after the snapshot. A node with 50 000 committed entries recovers in milliseconds, not seconds.
 
-### Run a containerised cluster (Docker)
+### Start a containerised cluster
 
 ```bash
-make docker-build          # build kv-fabric:latest
-
-make docker-cluster-start  # bring up 3-node cluster (docker compose)
-                           # exposes kv ports 9001-9003 on the host
-
-make docker-cluster-stop   # stop containers, keep WAL volumes
-make docker-cluster-clean  # stop containers, delete WAL volumes
+make docker-build          # build the image (do this first)
+make docker-cluster-start  # three containers, ports 9001-9003 on host
+make docker-cluster-stop   # keep volumes
+make docker-cluster-clean  # delete volumes too
 ```
-
-### Docker (in-process scenarios / benchmark)
-
-```bash
-make docker-scenarios  # run all failure scenarios inside Docker
-make docker-bench      # run the 80-run benchmark inside Docker
-```
-
-The Docker image is a two-stage build: `golang:1.21-alpine` builder (CGO_ENABLED=0, fully static binary), `alpine:3.20` runtime. The ENTRYPOINT is `./scenarios`; `make docker-scenarios` uses the default `CMD ["all"]`. `make docker-bench` overrides ENTRYPOINT to `./benchmark`.
 
 ---
 
-## Benchmark
+## Benchmark interpretation
 
-Run `make bench` to generate results on your hardware. The benchmark prints a markdown table at the end. Below is a guide to interpreting each column.
+`make bench` prints a Markdown table. Key things to look for:
 
-| Column     | Meaning                                                      |
-| ---------- | ------------------------------------------------------------ |
-| `Workload` | Operation mix (write%, read%, scan%)                         |
-| `Mode`     | Consistency mode for reads                                   |
-| `Conc`     | Number of concurrent goroutines                              |
-| `ops/s`    | Total successful operations per second                       |
-| `p50 ms`   | Median latency                                               |
-| `p99 ms`   | 99th percentile latency                                      |
-| `p999 ms`  | 99.9th percentile latency                                    |
-| `stale%`   | Fraction of reads where `IsStale=true` (eventual reads only) |
+**Consistency mode does not affect write throughput.** Mode is a read-side contract. All four modes produce identical ops/sec on `write-only` workloads because every write goes through the same Raft propose path regardless.
 
-**Key findings from the 80-run matrix:**
+**The `ReadIndex` tax is measurable.** In `read-heavy` workloads, `strong` mode issues a heartbeat quorum for every read. On a real network with 1–5 ms RTT this becomes the dominant cost. The in-process benchmark shows a smaller gap because channel latency is sub-millisecond.
 
-**Finding 1: Consistency mode does not affect write throughput.**
-The `write-only` workload produces identical ops/s across all four modes at every concurrency level. Mode is a read-side contract; writes always go through `LeaderReplicator.Propose()` regardless of mode.
+**RYW and monotonic converge with strong under write pressure.** When writes are fast enough to keep followers perpetually behind, every RYW/monotonic read falls back to the leader (the client's watermark always exceeds the follower's applied index). Throughput matches strong. This is correct behavior — the modes fail-safe rather than serving stale data below the client's guaranteed version.
 
-**Finding 2: The ReadIndex tax is real and measurable.**
-In `read-heavy` workload, `strong` mode issues a Raft heartbeat for every read (ConfirmLeadership). This appears as roughly 1 Raft RTT of additional latency per read and a corresponding throughput reduction versus `eventual`. The RTT is in-process (InMemTransport), so on a real network with 1–5 ms RTT the gap would be larger.
-
-**Finding 3: Monotonic and RYW read throughput converges with `strong` at high concurrency under write pressure.**
-In `write-heavy` workload at high concurrency, followers are perpetually behind the leader. Both `monotonic` and `read-your-writes` modes fall back to the leader on every read (their watermarks and session tokens always exceed the follower's applied index). Effective throughput matches `strong`. This is the correct behavior — the modes degrade gracefully rather than serving stale data below the client's guaranteed version.
-
-**Finding 4: Eventual reads in `write-heavy` have the highest stale rate and longest estimated lag.**
-This is expected: the mode makes no catch-up guarantee. `stale%` and `LagMs` in the output are the observability surface — they let you measure how stale your eventual reads actually are in production before deciding whether to pay the linearizability tax.
-
----
-
-## Design decisions
-
-**Raft log index as MVCC version number.** The version number assigned to a write is `entry.Index` — the index of the committed Raft log entry. This eliminates the need for a separate version counter or a distributed ID generator. Because all nodes apply the same entry with the same index, all engines assign the same version. Version numbers are globally ordered, monotonically increasing, and free.
-
-**`KVEngine` as an interface.** Every layer above storage (`replication`, `consistency`, HTTP, gRPC) depends on `KVEngine`, not on `MVCCEngine`. This makes unit tests possible: a test can inject a fake engine without starting a Raft cluster. The consistency package's unit tests never touch Raft.
-
-**`pendingOp` keyed by `fmt.Sprintf("%p", resultCh)`.** The channel pointer is unique per proposal within the process lifetime. This avoids a coordination point for generating unique IDs, and it makes the key stable even if the Raft log index is not yet known at registration time (necessary for pre-registration before `l.raft.Propose()` returns).
-
-**Both `LeaderReplicator` and `FollowerApplier` run on every node.** After a leader election, the new leader's `LeaderReplicator` starts accepting proposals immediately — no wiring change needed. `IsLeader()` gates the proposal path; the apply loop is always running. On a node that is not the leader, `LeaderReplicator.Propose()` returns a redirect error immediately.
-
-**`lagLoop` instead of raftly `FollowerProgress`.** raftly's `FollowerProgress` map returns the leader's view of peer match indices, which is accurate but only meaningful on the leader. `lagLoop` polls every node's `adapter.AppliedIndex()` every 50 ms and pushes it into the shared `ReplicationTracker`. This gives every node — including followers — accurate lag data for serving `IsStale` and `LagMs` on eventual reads.
-
-**In-process cluster for scenarios and benchmarks.** InMemTransport carries real Raft consensus with zero network overhead. ChaosInjector injects the same failure modes as real hardware by intercepting messages at the NetworkProxy layer. The scenarios produce real numbers because the apply path, MVCC engine, and GC are exercised exactly as in production — just without the network RTT variable.
-
-**gRPC redirect, not server-to-server forwarding.** When a non-leader node receives a write or a strong read, it returns `redirect_to` (the leader's KV address) in the response body rather than proxying the request internally. This keeps the data path transparent: every hop is visible in client logs, latency is attributable to the correct node, and the leader's goroutine pool is not inflated by proxy connections. The client library handles retry transparently.
-
-**Snapshot version = max(gcHorizon, highest live entry version).** The snapshot version determines where Raft log replay starts after a crash recovery. Using `gcHorizon` alone is wrong: it is only advanced by GC, which runs on a 10-minute ticker and may never fire in short-lived test runs. A node that crashes before GC fires would record version 0, then replay the full log from index 0 on restart — defeating the point. Using the highest version among live entries gives the correct recovery starting point without requiring any additional tracking in the engine.
-
-**Two-phase atomic snapshot write.** `SnapshotManager.persist()` writes data to a temp file, then `os.Rename`s it to the final path. `os.Rename` is atomic on POSIX — a crash between write and rename leaves the previous snapshot intact. The meta file is written after the data file, so if you see a meta file on disk, the data file behind it is always complete.
+**`stale%` is the cost of eventual.** In `write-heavy` workloads, eventual reads have the highest stale rate and the widest `LagMs` range. This is the number to show your product team when they ask "how stale is eventual, really?"
 
 ---
 
 ## Dependencies
 
-| Package                               | Version | Role                                                                     |
-| ------------------------------------- | ------- | ------------------------------------------------------------------------ |
-| `github.com/ani03sha/raftly`          | v0.2.0  | Raft consensus library (leader election, log replication, commit quorum) |
-| `go.uber.org/zap`                     | v1.27.1 | Structured logging                                                       |
-| `github.com/prometheus/client_golang` | v1.23.2 | Metrics: op counters, latency histograms, replication lag gauges         |
-| `github.com/spf13/cobra`              | v1.10.2 | `kvctl` CLI                                                              |
-| `google.golang.org/grpc`              | v1.80.0 | Client-facing KV API and inter-node Raft transport                       |
-| `google.golang.org/protobuf`          | v1.36.11 | Protocol Buffers for `proto/kv_fabric.proto`                            |
+| Package                               | Version  | Role                                                      |
+| ------------------------------------- | -------- | --------------------------------------------------------- |
+| `github.com/ani03sha/raftly`          | v0.2.0   | Raft consensus: elections, log replication, commit quorum |
+| `go.uber.org/zap`                     | v1.27.1  | Structured logging                                        |
+| `github.com/prometheus/client_golang` | v1.23.2  | Metrics                                                   |
+| `github.com/spf13/cobra`              | v1.10.2  | `kvctl` CLI                                               |
+| `google.golang.org/grpc`              | v1.80.0  | Client-facing KV API and inter-node Raft transport        |
+| `google.golang.org/protobuf`          | v1.36.11 | Protocol Buffers                                          |
