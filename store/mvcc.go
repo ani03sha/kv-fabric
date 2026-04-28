@@ -369,14 +369,15 @@ func makeCopy(b []byte) []byte {
 // --- VersionChain helpers ---
 // All of these MUST be called with chain.mu held.
 
-// Returns the most recent non-deleted version, or nil.
+// Returns the last appended version (which may be a tombstone), or nil.
+// Callers check v.Deleted themselves to distinguish "key is live" from "key was deleted".
+// Returning tombstones here is intentional: hiding them caused latestLocked to return
+// the old live entry even after a Delete, making deleted keys appear alive in Get/Snapshot.
 func (c *VersionChain) latestLocked() *Version {
-	for i := len(c.versions) - 1; i >= 0; i-- {
-		if !c.versions[i].Deleted {
-			return &c.versions[i]
-		}
+	if len(c.versions) == 0 {
+		return nil
 	}
-	return nil
+	return &c.versions[len(c.versions)-1]
 }
 
 // Returns the latest version with Num <= max, or nil. Used for snapshot reads: "what was the value of this key at version V?"

@@ -19,6 +19,7 @@ const (
 	OpDelete
 	OpBeginTxn
 	OpCommitTxn
+	OpAbortTxn
 )
 
 // This is the unit that travels through Raft log.
@@ -105,6 +106,10 @@ type LeaderReplicator struct {
 
 	semiSync *SemiSyncReplicator // nil => async mode, non-nil => semi-sync mode
 	snapMgr  *SnapshotManager    // nil => no snapshotting
+
+	// txnBuf holds buffered operations for in-progress transactions.
+	// Keyed by TxnID. Only accessed from the single-threaded applyLoop — no mutex needed.
+	txnBuf map[uint64][]KVOperation
 }
 
 func NewLeaderReplicator(
@@ -121,6 +126,7 @@ func NewLeaderReplicator(
 		tracker: tracker,
 		logger:  logger,
 		pending: make(map[string]*pendingOp),
+		txnBuf:  make(map[uint64][]KVOperation),
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
@@ -246,19 +252,60 @@ func (l *LeaderReplicator) applyEntry(entry CommittedEntry) error {
 
 	switch op.Type {
 	case OpPut:
-		r, err := l.engine.Put(op.Key, op.Value, store.PutOptions{
+		if op.TxnID != 0 {
+			// Buffer inside an open transaction; apply at commit time.
+			l.txnBuf[op.TxnID] = append(l.txnBuf[op.TxnID], op)
+			result = applyResult{}
+		} else {
 			// LogIndex makes the Raft log index the version number.
 			// Every node applies this same entry with this same index,
 			// so every node's engine assigns version = entry.Index to this write.
-			LogIndex:  entry.Index,
-			IfVersion: op.IfVersion,
-		})
-		result = applyResult{putResult: r, err: err}
+			r, err := l.engine.Put(op.Key, op.Value, store.PutOptions{
+				LogIndex:  entry.Index,
+				IfVersion: op.IfVersion,
+			})
+			result = applyResult{putResult: r, err: err}
+		}
 	case OpDelete:
-		err := l.engine.Delete(op.Key, store.DeleteOptions{})
-		result = applyResult{err: err}
+		if op.TxnID != 0 {
+			l.txnBuf[op.TxnID] = append(l.txnBuf[op.TxnID], op)
+			result = applyResult{}
+		} else {
+			err := l.engine.Delete(op.Key, store.DeleteOptions{})
+			result = applyResult{err: err}
+		}
+	case OpBeginTxn:
+		l.txnBuf[op.TxnID] = nil
+		result = applyResult{}
+	case OpCommitTxn:
+		// Flush all buffered ops atomically. All keys get entry.Index as their version,
+		// so the entire transaction appears at a single version — same on every node.
+		ops := l.txnBuf[op.TxnID]
+		delete(l.txnBuf, op.TxnID)
+		var commitErr error
+		for i := 0; i < len(ops) && commitErr == nil; i++ {
+			switch ops[i].Type {
+			case OpPut:
+				r, err := l.engine.Put(ops[i].Key, ops[i].Value, store.PutOptions{
+					LogIndex:  entry.Index,
+					IfVersion: ops[i].IfVersion,
+				})
+				if err != nil {
+					commitErr = err
+				} else {
+					result = applyResult{putResult: r}
+				}
+			case OpDelete:
+				commitErr = l.engine.Delete(ops[i].Key, store.DeleteOptions{})
+			}
+		}
+		if commitErr != nil {
+			result = applyResult{err: commitErr}
+		}
+	case OpAbortTxn:
+		delete(l.txnBuf, op.TxnID)
+		result = applyResult{}
 	default:
-		// TODO
 		result = applyResult{}
 	}
 

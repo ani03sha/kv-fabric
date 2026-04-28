@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/ani03sha/kv-fabric/store"
 	"github.com/ani03sha/raftly/raft"
 	"github.com/ani03sha/raftly/transport"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
 
@@ -21,6 +23,7 @@ func main() {
 	nodeID := flag.String("id", "", "Node ID, e.g. node-1 (required)")
 	raftAddr := flag.String("raft-addr", "", "Raft gRPC listen address, e.g. :7001 (required)")
 	kvAddr := flag.String("kv-addr", "", "KV gRPC listen address, e.g. :9001 (required)")
+	metricsAddr := flag.String("metrics-addr", "", "Prometheus /metrics listen address, e.g. :9101 (optional)")
 	dataDir := flag.String("data-dir", "", "WAL directory (default: data/<id>)")
 	raftPeers := flag.String("raft-peers", "", `Raft peer addresses: "node-2=:7002,node-3=:7003"`)
 	kvPeers := flag.String("kv-peers", "", `KV peer addresses:   "node-2=:9002,node-3=:9003"`)
@@ -118,6 +121,33 @@ func main() {
 	leaderRepl := replication.NewLeaderReplicator(*nodeID, engine, adapter, tracker, logger)
 	leaderRepl.SetSnapshotManager(snapMgr)
 
+	// ── Prometheus metrics ────────────────────────────────────────────────────
+	//
+	// NewMetrics registers gauges and histograms into the default Prometheus
+	// registry. An observability goroutine samples the engine and tracker every
+	// 5 seconds and updates those metrics. The HTTP server exposes /metrics at
+	// --metrics-addr if the flag is set; otherwise metrics are collected but not
+	// scraped (useful for embedding in tests).
+	metrics := server.NewMetrics(nil)
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			metrics.ObserveEngine(engine.Stats(), store.GCStats{})
+			metrics.ObserveTracker(tracker)
+		}
+	}()
+	var metricsSrv *http.Server
+	if *metricsAddr != "" {
+		metricsSrv = &http.Server{Addr: *metricsAddr, Handler: promhttp.Handler()}
+		go func() {
+			logger.Info("metrics server listening", zap.String("addr", *metricsAddr))
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Error("metrics server error", zap.Error(err))
+			}
+		}()
+	}
+
 	// ── Start in dependency order ─────────────────────────────────────────────
 	//
 	// LeaderReplicator runs on every node, leader and follower alike.
@@ -161,6 +191,9 @@ func main() {
 	<-quit
 
 	logger.Info("shutting down", zap.String("id", *nodeID))
+	if metricsSrv != nil {
+		metricsSrv.Close()
+	}
 	grpcSrv.GracefulStop()
 	snapMgr.Stop()
 	leaderRepl.Stop()

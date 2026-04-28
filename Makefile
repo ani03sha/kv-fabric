@@ -54,19 +54,19 @@ scenario-dirty-read: build
 cluster-start: build
 	@mkdir -p data/node-1 data/node-2 data/node-3
 	@$(SERVER_BIN) \
-		--id node-1 --raft-addr :7001 --kv-addr :9001 \
+		--id node-1 --raft-addr :7001 --kv-addr :9001 --metrics-addr :9101 \
 		--raft-peers "node-2=:7002,node-3=:7003" \
 		--kv-peers   "node-2=:9002,node-3=:9003" \
 		--data-dir data/node-1 \
 		>> /tmp/kv-fabric-node-1.log 2>&1 & echo $$! > /tmp/kv-fabric-node-1.pid
 	@$(SERVER_BIN) \
-		--id node-2 --raft-addr :7002 --kv-addr :9002 \
+		--id node-2 --raft-addr :7002 --kv-addr :9002 --metrics-addr :9102 \
 		--raft-peers "node-1=:7001,node-3=:7003" \
 		--kv-peers   "node-1=:9001,node-3=:9003" \
 		--data-dir data/node-2 \
 		>> /tmp/kv-fabric-node-2.log 2>&1 & echo $$! > /tmp/kv-fabric-node-2.pid
 	@$(SERVER_BIN) \
-		--id node-3 --raft-addr :7003 --kv-addr :9003 \
+		--id node-3 --raft-addr :7003 --kv-addr :9003 --metrics-addr :9103 \
 		--raft-peers "node-1=:7001,node-2=:7002" \
 		--kv-peers   "node-1=:9001,node-2=:9002" \
 		--data-dir data/node-3 \

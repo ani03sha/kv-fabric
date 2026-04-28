@@ -7,8 +7,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ani03sha/kv-fabric/benchmark"
+	"github.com/ani03sha/kv-fabric/scenarios"
 	"github.com/ani03sha/kv-fabric/store"
 	"github.com/spf13/cobra"
+	"go.uber.org/zap"
 )
 
 // --- Global flags ---
@@ -294,9 +297,10 @@ func init() {
 
 var benchCmd = &cobra.Command{
 	Use:   "bench",
-	Short: "Run the benchmark harness (implemented in Phase 11)",
+	Short: "Run the benchmark harness against the cluster",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return fmt.Errorf("bench: not yet implemented — available after Phase 11")
+		benchmark.RunBenchmark(zap.NewNop())
+		return nil
 	},
 }
 
@@ -308,10 +312,28 @@ func init() {
 
 var scenarioCmd = &cobra.Command{
 	Use:   "scenario <name>",
-	Short: "Run a failure scenario (implemented in Phase 10)",
+	Short: "Run a failure scenario: phantom | booking | mvcc-bloat | dirty-read | all",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return fmt.Errorf("scenario %q: not yet implemented — available after Phase 10", args[0])
+		logger := zap.NewNop()
+		switch args[0] {
+		case "phantom":
+			scenarios.RunPhantomDurability(logger)
+		case "booking":
+			scenarios.RunBookingCom(logger)
+		case "mvcc-bloat":
+			scenarios.RunMVCCBloat(logger)
+		case "dirty-read":
+			scenarios.RunDirtyRead(logger)
+		case "all":
+			scenarios.RunPhantomDurability(logger)
+			scenarios.RunBookingCom(logger)
+			scenarios.RunMVCCBloat(logger)
+			scenarios.RunDirtyRead(logger)
+		default:
+			return fmt.Errorf("unknown scenario %q — available: phantom, booking, mvcc-bloat, dirty-read, all", args[0])
+		}
+		return nil
 	},
 }
 

@@ -28,6 +28,10 @@ type FollowerApplier struct {
 	appliedIndex atomic.Uint64 // the highest index this follower has applied
 	snapMgr      *SnapshotManager
 
+	// txnBuf mirrors the leader's buffer. Followers apply the same Raft log entries
+	// in the same order, so transaction semantics are identical without coordination.
+	txnBuf map[uint64][]KVOperation
+
 	stop chan struct{}
 	done chan struct{}
 }
@@ -43,6 +47,7 @@ func NewFollowerApplier(
 		engine: engine,
 		raft:   raft,
 		logger: logger,
+		txnBuf: make(map[uint64][]KVOperation),
 		stop:   make(chan struct{}),
 		done:   make(chan struct{}),
 	}
@@ -101,16 +106,46 @@ func (f *FollowerApplier) applyEntry(entry CommittedEntry) error {
 
 	switch op.Type {
 	case OpPut:
-		if _, err := f.engine.Put(op.Key, op.Value, store.PutOptions{
-			LogIndex:  entry.Index,
-			IfVersion: op.IfVersion,
-		}); err != nil {
-			return fmt.Errorf("follower %s: apply entry %d: put %q: %w", f.nodeID, entry.Index, op.Key, err)
+		if op.TxnID != 0 {
+			f.txnBuf[op.TxnID] = append(f.txnBuf[op.TxnID], op)
+		} else {
+			if _, err := f.engine.Put(op.Key, op.Value, store.PutOptions{
+				LogIndex:  entry.Index,
+				IfVersion: op.IfVersion,
+			}); err != nil {
+				return fmt.Errorf("follower %s: apply entry %d: put %q: %w", f.nodeID, entry.Index, op.Key, err)
+			}
 		}
 	case OpDelete:
-		if err := f.engine.Delete(op.Key, store.DeleteOptions{}); err != nil {
-			return fmt.Errorf("follower %s: apply entry %d: delete %q: %w", f.nodeID, entry.Index, op.Key, err)
+		if op.TxnID != 0 {
+			f.txnBuf[op.TxnID] = append(f.txnBuf[op.TxnID], op)
+		} else {
+			if err := f.engine.Delete(op.Key, store.DeleteOptions{}); err != nil {
+				return fmt.Errorf("follower %s: apply entry %d: delete %q: %w", f.nodeID, entry.Index, op.Key, err)
+			}
 		}
+	case OpBeginTxn:
+		f.txnBuf[op.TxnID] = nil
+	case OpCommitTxn:
+		ops := f.txnBuf[op.TxnID]
+		delete(f.txnBuf, op.TxnID)
+		for i := 0; i < len(ops); i++ {
+			switch ops[i].Type {
+			case OpPut:
+				if _, err := f.engine.Put(ops[i].Key, ops[i].Value, store.PutOptions{
+					LogIndex:  entry.Index,
+					IfVersion: ops[i].IfVersion,
+				}); err != nil {
+					return fmt.Errorf("follower %s: commit txn %d: put %q: %w", f.nodeID, op.TxnID, ops[i].Key, err)
+				}
+			case OpDelete:
+				if err := f.engine.Delete(ops[i].Key, store.DeleteOptions{}); err != nil {
+					return fmt.Errorf("follower %s: commit txn %d: delete %q: %w", f.nodeID, op.TxnID, ops[i].Key, err)
+				}
+			}
+		}
+	case OpAbortTxn:
+		delete(f.txnBuf, op.TxnID)
 	}
 	// Record how far we have applied so the leader can track our lag.
 	f.appliedIndex.Store(entry.Index)
